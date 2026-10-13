@@ -1,0 +1,43 @@
+SAJÁT ZENE A JÁTÉKHOZ
+=====================
+
+Ebbe a mappába (assets/music) teheted a saját háttérzenéidet. A játék magától megtalálja
+őket, nem kell semmit átállítani vagy újra összerakni.
+
+Elnevezés
+---------
+  zene-1.mp3, zene-2.mp3, zene-3.mp3 ... legfeljebb zene-20
+
+- A számozás 1-től induljon, és ne legyen benne lyuk: ha nincs zene-2, akkor a zene-3-at
+  és az utána következőket a játék már nem keresi.
+- Kisbetűvel, ékezet és szóköz nélkül: zene-1.mp3 (nem Zene 1.mp3).
+- A sorrend a számozás sorrendje; a játék ebben a sorrendben, áttűnéssel játssza le őket,
+  a végén elölről kezdi.
+
+Formátum
+--------
+- MP3: 160-192 kbit/s ajánlott (jó minőség, kis fájl).
+- OGG (Vorbis vagy Opus): ugyanígy elnevezve, pl. zene-2.ogg; hézagmentes ismétléshez ez a
+  legjobb.
+- M4A (AAC): pl. zene-3.m4a.
+- Egy számhoz csak egy fájl kell (ha mégis több van, az .mp3 az első, aztán .ogg, aztán .m4a).
+
+Feltöltés a GitHubon
+--------------------
+- A GitHub weboldalán egy fájl legfeljebb 25 MB lehet. Egy 3-4 perces dal 160 kbit/s-os
+  MP3-ként kb. 4-5 MB, ez bőven belefér.
+- Üres mappát a GitHub nem tárol: ha még nincs assets/music mappa a tárolóban, nyisd meg az
+  assets mappát, és ott Add file -> Upload files; a fájlok neve elé írd: music/
+  (vagy húzd be a számítógépen előkészített music mappát a zene-1.mp3 fájllal együtt).
+- Ha a mappa már megvan: nyisd meg az assets/music mappát a GitHubon, Add file -> Upload
+  files, húzd be a fájlokat, majd Commit changes.
+
+Fontos: a tároló nyilvános, a zenéket bárki letöltheti. Csak saját vagy szabad licencű
+(CC0 vagy CC-BY, a szerző feltüntetésével) zenét tölts fel.
+
+A játékban
+----------
+- Ha van saját zene, az lesz az alapértelmezett. A pult zenélő dobozával válthatsz:
+  Saját zenék -> Esti dallam -> Gyertyafény -> Csend.
+- A hangerő a Beállítások -> Hang -> Zene hangereje csúszkával állítható.
+- Az első lejátszás után a zene internet nélkül is megy (a játék megjegyzi).
