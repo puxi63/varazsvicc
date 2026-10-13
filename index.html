@@ -743,20 +743,20 @@ const DISPLAY_BOXES = [
 ];
 
 /**
- * Heaps: big elliptical mounds of figurines (radii rx / rz) on a bell-shaped straw core `core` metres high, with the
- * figurines piled on it about one and a half layers deep, so the top reaches about chest height. The player walks
- * around them (an elliptical collider covers the inner `HEAP_SOLID` part) and grabs the uncovered ones. Quotas are
- * shares of the spawn pool; the crates take a small share each (the large figurines fill a crate quickly).
+ * Heaps: big elliptical mounds of figurines (radii rx / rz). A low bell-shaped straw core (`core` metres) only gives the
+ * mound its shape and shows as a straw skirt at the rim; the figurines dropped onto it pile up into the mound itself,
+ * resting on each other (see buildPile). The player walks around them (an elliptical collider covers the inner
+ * `HEAP_SOLID` part) and grabs the uncovered ones. Quotas are shares of the spawn pool; the crates take a small share.
  */
 const HEAP_DEFS = [
-  { id: 'H1', x: -4.2, z: -1.35, rx: 1.55, rz: 2.0, core: 0.6, share: 40 },
-  { id: 'H2', x: 4.25, z: -1.2, rx: 1.55, rz: 2.0, core: 0.6, share: 38 },
-  { id: 'H3', x: 1.75, z: 3.2, rx: 1.0, rz: 0.95, core: 0.4, share: 13 },
+  { id: 'H1', x: -4.2, z: -1.35, rx: 1.4, rz: 1.8, core: 0.3, share: 40 },
+  { id: 'H2', x: 4.25, z: -1.2, rx: 1.4, rz: 1.8, core: 0.3, share: 38 },
+  { id: 'H3', x: 1.75, z: 3.2, rx: 0.95, rz: 0.9, core: 0.2, share: 13 },
 ];
 /** Normalised heap radius inside which the pile is solid for the player. */
 const HEAP_SOLID = 0.72;
 /** Save layout generation: saves from older layouts keep their shelves and stack, loose heap figurines are re-spawned. */
-const LAYOUT_VERSION = 2;
+const LAYOUT_VERSION = 3;
 const CRATE_DEFS = [
   { id: 'C1', minX: 6.8, maxX: 7.6, minZ: -7.8, maxZ: -7.0, share: 1.6 },
   { id: 'C2', minX: 3.4, maxX: 4.2, minZ: -7.6, maxZ: -6.8, share: 1.4 },
@@ -1955,6 +1955,9 @@ function figBuildBase(lod) {
       [FIG_LACQUER, 0.22, 0, 1, 0, [[2.66, 1.8], [0.0, 1.8]]],
     ];
   for (const [hex, rough, metal, coat, flag, pts] of bands) P.add(figLathe(S(pts), segs), hex, rough, metal, coat, flag);
+  // Underside in the category's enamel colour (flag 255, like the ring band): seen end-on in the figurine piles it is a
+  // bright, sortable colour cue instead of a dark hole.
+  P.add(figLathe(S([[0.0, 0.0], [3.3, 0.0]]), segs), 0xffffff, 0.6, 0, 0, 255);
   if (lod < 2) {
     /* Medallion: gilt rim and a lacquer field whose symbol comes from the atlas (flag 128) */
     const ms = lod === 0 ? 28 : 14;
@@ -9664,10 +9667,13 @@ function poseRandom(rec, x, y, z, r, upright = 0.3, lying = 0.5) {
 }
 
 /* ------------------------------------------------------------------------------------------------
-   Piles: the straw heaps are real mounds of figurines. Each heap has a bell-shaped straw core (h0 high); figurines
-   are laid on it one by one and rest on the core or on the figurines below them, following the slope. Every pile
-   figurine knows what it rests on (under) and what rests on it (over): only uncovered ones can be picked up, and when
-   one leaves the pile the ones above settle down onto what is left (no physics, a few position updates).
+   Piles: the straw heaps are real mounds of figurines. Each heap keeps a fine surface grid (2 cm cells: the low straw
+   core plus the top surface of every figurine laid on it, rasterised from the figurine's own far-LOD mesh and base).
+   A figurine is dropped onto the pile: for a few nearby spots and orientations its resting height is where its
+   lowest-reaching point first touches the surface, and the pose with the lowest centre of mass wins, so it rolls into
+   gaps and comes to rest lying on the straw and on the figurines below it (deterministic from the seed, no physics).
+   Every pile figurine knows what it rests on (under) and what rests on it (over): only uncovered ones can be picked up,
+   and when one leaves the pile the ones that rested on it are dropped again onto what is left.
    ------------------------------------------------------------------------------------------------ */
 
 /** Height profile of a heap core, r = normalised radius 0..1 (smooth bell: flat top, flat rim). */
@@ -9686,65 +9692,443 @@ function heapAt(x, z, k = 1) {
   return null;
 }
 
-const PILE_AXIS = new THREE.Vector3();
-/** Where the three footprint circles sit along a figurine's axis. */
-const PILE_T = [0.15, 0.5, 0.85];
+/**
+ * Pile tuning: grid cell, contact tolerance, search sizes, the share of figurines that may stand upright and the soft
+ * readability weights; `log` keeps the last few re-drops of settleHeap() for diagnostics (bounded).
+ */
+const PILE = {
+  cell: 0.02, touch: 0.03, evalPts: 72, spots: 5, turns: 9, spread: 0.24, drop: 0.42, upright: 0.07, bulk: false, col: {}, seq: 0,
+  wRadial: 0.05, wFace: 0.03, log: [],
+};
+/** Small turns tried around the chosen pose (about the world X / Z axes and the figure's own axis): it tips into rest. */
+const PILE_NUDGE = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]];
+const PILE_AX = new THREE.Vector3();
+const PILE_Q3 = new THREE.Quaternion();
+const PILE_M = new THREE.Matrix3();
+const PILE_U = new THREE.Vector3();
+const PILE_Q = new THREE.Quaternion();
+const PILE_Q2 = new THREE.Quaternion();
 
-/** Updates a pile figurine's footprint (three circles along its axis, radius rho) and its bottom / top height. */
-function pileExtent(rec) {
-  const s = rec.scale;
-  const m = rec.met;
-  PILE_AXIS.set(0, 1, 0).applyQuaternion(rec.quat);
-  const len = m.totalH * s;
-  const rho = Math.max(m.baseR, m.radius * 0.75) * s;
-  const horiz = Math.sqrt(Math.max(0, 1 - PILE_AXIS.y * PILE_AXIS.y));
-  const y0 = rec.pos.y;
-  const y1 = rec.pos.y + PILE_AXIS.y * len;
-  const P = rec.pileP || (rec.pileP = new Float32Array(6));
-  for (let k = 0; k < 3; k++) {
-    P[k * 2] = rec.pos.x + PILE_AXIS.x * len * PILE_T[k];
-    P[k * 2 + 1] = rec.pos.z + PILE_AXIS.z * len * PILE_T[k];
-  }
-  rec.pileRho = rho;
-  rec.pileReach = rho + len * horiz * 0.35;
-  rec.pileBottom = Math.min(y0, y1) - rho * horiz;
-  rec.pileTop = Math.max(y0, y1) + rho * horiz;
-  rec.pileUpright = PILE_AXIS.y > 0.7;
-}
-
-/** True when the footprints of two pile figurines overlap. */
-function pileOverlap(a, b) {
-  const lim = a.pileRho + b.pileRho - 0.02;
-  if (lim <= 0) return false;
-  const A = a.pileP;
-  const B = b.pileP;
-  const mx = A[2] - B[2];
-  const mz = A[3] - B[3];
-  const reach = a.pileReach + b.pileReach;
-  if (mx * mx + mz * mz > reach * reach) return false;
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      const dx = A[i * 2] - B[j * 2];
-      const dz = A[i * 2 + 1] - B[j * 2 + 1];
-      if (dx * dx + dz * dz < lim * lim) return true;
+/**
+ * Collision mesh of a design in pose space (metres at scale 1, origin at the base bottom centre): the far-LOD figure
+ * mesh plus a 12-sided base cylinder, the centre of mass and a spread-out subset of points for the drop search.
+ */
+function pileCollider(id) {
+  const g = figGeo(id);
+  const cached = PILE.col[id];
+  if (cached && cached.baked === g.baked) return cached;
+  const d = FIG_BY_ID[id];
+  const met = getFigureMetrics(id);
+  const e = g.lods[2];
+  const far = e.far || figFloatCopy(e);
+  const nv = far.pos.length / 3;
+  const pts = [];
+  const tri = [];
+  for (let v = 0; v < nv; v++) pts.push(far.pos[v * 3] * FIG_CM, met.baseH + far.pos[v * 3 + 1] * FIG_CM, far.pos[v * 3 + 2] * FIG_CM);
+  for (let i = 0; i < far.index.length; i++) tri.push(far.index[i]);
+  if (!d.ownBase) {
+    const seg = 12;
+    const b0 = pts.length / 3;
+    for (let k = 0; k < seg; k++) {
+      const a = (k / seg) * Math.PI * 2;
+      const x = Math.cos(a) * met.baseR;
+      const z = Math.sin(a) * met.baseR;
+      pts.push(x, 0, z, x, met.baseH, z);
+    }
+    const c0 = pts.length / 3;
+    pts.push(0, 0, 0, 0, met.baseH, 0);
+    for (let k = 0; k < seg; k++) {
+      const a0 = b0 + k * 2;
+      const a1 = b0 + ((k + 1) % seg) * 2;
+      tri.push(a0, a1, a0 + 1, a1, a1 + 1, a0 + 1, c0, a1, a0, c0 + 1, a0 + 1, a1 + 1);
     }
   }
-  return false;
+  const n = pts.length / 3;
+  // Centre of mass on the axis, low: a resin statuette on a solid plinth is base-heavy (a vertex average would put it
+  // near the detailed head and the figurines would come to rest head down, bases up).
+  const cx = 0;
+  const cy = met.totalH * (d.ownBase ? 0.36 : 0.3) * n;
+  const cz = 0;
+  // Evaluation subset: a regular stride plus the extreme points along each axis (the likely contact points).
+  const sub = new Set();
+  const stride = Math.max(1, Math.floor(n / PILE.evalPts));
+  for (let v = 0; v < n; v += stride) sub.add(v);
+  for (let ax = 0; ax < 3; ax++) {
+    let lo = 0;
+    let hi = 0;
+    for (let v = 1; v < n; v++) {
+      if (pts[v * 3 + ax] < pts[lo * 3 + ax]) lo = v;
+      if (pts[v * 3 + ax] > pts[hi * 3 + ax]) hi = v;
+    }
+    sub.add(lo);
+    sub.add(hi);
+  }
+  const col = {
+    baked: g.baked, pts: new Float32Array(pts), tri: Uint32Array.from(tri), n, com: [cx / n, cy / n, cz / n],
+    sub: Uint32Array.from([...sub]), world: new Float32Array(n * 3),
+  };
+  PILE.col[id] = col;
+  return col;
 }
 
-/** Highest straw core height under a figurine's footprint. */
-function pileCoreUnder(rec) {
-  let h = 0;
-  for (let k = 0; k < 3; k++) h = Math.max(h, heapHeightAt(rec.pileP[k * 2], rec.pileP[k * 2 + 1]));
-  return h;
+/** Surface grid of a heap with just the straw core (heights in metres, owner = handle of the figurine on top). */
+function pileGridReset(hp) {
+  const C = PILE.cell;
+  if (!hp.grid) {
+    const nx = Math.ceil((hp.rx * 2 + 1.2) / C);
+    const nz = Math.ceil((hp.rz * 2 + 1.2) / C);
+    hp.grid = { x0: hp.x - (nx * C) / 2, z0: hp.z - (nz * C) / 2, nx, nz, h: new Float32Array(nx * nz), own: new Int32Array(nx * nz), core: new Float32Array(nx * nz) };
+    const g = hp.grid;
+    for (let iz = 0; iz < nz; iz++) {
+      for (let ix = 0; ix < nx; ix++) {
+        g.core[ix + iz * nx] = hp.h0 * heapBell(heapRadius(hp, g.x0 + (ix + 0.5) * C, g.z0 + (iz + 0.5) * C));
+      }
+    }
+  }
+  hp.grid.h.set(hp.grid.core);
+  hp.grid.own.fill(-1);
+  return hp.grid;
 }
 
-/** Moves a pile figurine vertically by dy (keeps its cached extent in step). */
-function pileShift(rec, dy) {
-  rec.pos.y += dy;
-  rec.groundY += dy;
-  rec.pileBottom += dy;
-  rec.pileTop += dy;
+/**
+ * Surface height at (x, z), bilinear between cell centres (the floor outside the grid). Continuous, so a pose that is
+ * saved with millimetre precision rests at the same height after loading.
+ */
+function pileH(g, x, z) {
+  const fx = (x - g.x0) / PILE.cell - 0.5;
+  const fz = (z - g.z0) / PILE.cell - 0.5;
+  const ix = Math.floor(fx);
+  const iz = Math.floor(fz);
+  if (ix < 0 || iz < 0 || ix >= g.nx - 1 || iz >= g.nz - 1) return 0;
+  const tx = fx - ix;
+  const tz = fz - iz;
+  const i = ix + iz * g.nx;
+  const H = g.h;
+  return (H[i] * (1 - tx) + H[i + 1] * tx) * (1 - tz) + (H[i + g.nx] * (1 - tx) + H[i + g.nx + 1] * tx) * tz;
+}
+
+function pileCellOf(g, x, z) {
+  const ix = Math.floor((x - g.x0) / PILE.cell);
+  const iz = Math.floor((z - g.z0) / PILE.cell);
+  if (ix < 0 || iz < 0 || ix >= g.nx || iz >= g.nz) return -1;
+  return ix + iz * g.nx;
+}
+
+/** Rotation (with scale) of a candidate orientation into PILE_M. */
+function pileMatrix(q, s) {
+  tm1.makeRotationFromQuaternion(q);
+  PILE_M.setFromMatrix4(tm1).multiplyScalar(s);
+  return PILE_M;
+}
+
+/**
+ * Resting height of a figurine with rotation+scale m at (x, z): the lowest base height at which none of its points
+ * (the subset, or all of them) is below the surface. Returns the height; the centre of mass follows from it.
+ */
+function pileRest(g, col, m, x, z, all) {
+  const e = m.elements;
+  const P = col.pts;
+  let rest = -1e9;
+  const n = all ? col.n : col.sub.length;
+  for (let k = 0; k < n; k++) {
+    const v = all ? k : col.sub[k];
+    const px = P[v * 3];
+    const py = P[v * 3 + 1];
+    const pz = P[v * 3 + 2];
+    const wx = e[0] * px + e[3] * py + e[6] * pz;
+    const wy = e[1] * px + e[4] * py + e[7] * pz;
+    const wz = e[2] * px + e[5] * py + e[8] * pz;
+    const need = pileH(g, x + wx, z + wz) - wy;
+    if (need > rest) rest = need;
+  }
+  return rest;
+}
+
+/** Centre of mass height offset for rotation+scale m. */
+function pileComY(col, m) {
+  const e = m.elements;
+  return e[1] * col.com[0] + e[4] * col.com[1] + e[7] * col.com[2];
+}
+
+/** World positions of a placed figurine's collision mesh (into col.world) and its bottom / footprint box. */
+function pileWorld(rec, col) {
+  pileMatrix(rec.quat, rec.scale);
+  const e = PILE_M.elements;
+  const P = col.pts;
+  const W = col.world;
+  let minY = 1e9;
+  let x0 = 1e9;
+  let x1 = -1e9;
+  let z0 = 1e9;
+  let z1 = -1e9;
+  for (let v = 0; v < col.n; v++) {
+    const px = P[v * 3];
+    const py = P[v * 3 + 1];
+    const pz = P[v * 3 + 2];
+    const wx = rec.pos.x + e[0] * px + e[3] * py + e[6] * pz;
+    const wy = rec.pos.y + e[1] * px + e[4] * py + e[7] * pz;
+    const wz = rec.pos.z + e[2] * px + e[5] * py + e[8] * pz;
+    W[v * 3] = wx;
+    W[v * 3 + 1] = wy;
+    W[v * 3 + 2] = wz;
+    if (wy < minY) minY = wy;
+    if (wx < x0) x0 = wx;
+    if (wx > x1) x1 = wx;
+    if (wz < z0) z0 = wz;
+    if (wz > z1) z1 = wz;
+  }
+  rec.pileBottom = minY;
+  rec.pileBox = [x0, z0, x1, z1];
+  return W;
+}
+
+/** Writes height h for handle at cell i when it is higher than what is there. */
+function pileWrite(g, i, h, owner) {
+  if (i >= 0 && h > g.h[i]) {
+    g.h[i] = h;
+    g.own[i] = owner;
+  }
+}
+
+const PILE_TMP = { h: null, mark: null, stamp: 0, cells: [] };
+
+/** Rasterises a figurine's top surface (triangles; each vertex marks its own cell as well) into a scratch footprint. */
+function pileFootprint(g, rec, col, W) {
+  const C = PILE.cell;
+  const N = g.nx * g.nz;
+  if (!PILE_TMP.h || PILE_TMP.h.length < N) {
+    PILE_TMP.h = new Float32Array(N);
+    PILE_TMP.mark = new Int32Array(N);
+  }
+  const TH = PILE_TMP.h;
+  const MK = PILE_TMP.mark;
+  const stamp = ++PILE_TMP.stamp;
+  const cells = PILE_TMP.cells;
+  cells.length = 0;
+  const put = (i, h) => {
+    if (i < 0) return;
+    if (MK[i] !== stamp) {
+      MK[i] = stamp;
+      TH[i] = h;
+      cells.push(i);
+    } else if (h > TH[i]) TH[i] = h;
+  };
+  const T = col.tri;
+  for (let v = 0; v < col.n; v++) put(pileCellOf(g, W[v * 3], W[v * 3 + 2]), W[v * 3 + 1]);
+  for (let t = 0; t < T.length; t += 3) {
+    const a = T[t] * 3;
+    const b = T[t + 1] * 3;
+    const c = T[t + 2] * 3;
+    const ax = W[a];
+    const az = W[a + 2];
+    const bx = W[b];
+    const bz = W[b + 2];
+    const cx = W[c];
+    const cz = W[c + 2];
+    const ix0 = Math.max(0, Math.floor((Math.min(ax, bx, cx) - g.x0) / C));
+    const ix1 = Math.min(g.nx - 1, Math.floor((Math.max(ax, bx, cx) - g.x0) / C));
+    const iz0 = Math.max(0, Math.floor((Math.min(az, bz, cz) - g.z0) / C));
+    const iz1 = Math.min(g.nz - 1, Math.floor((Math.max(az, bz, cz) - g.z0) / C));
+    if (ix1 <= ix0 && iz1 <= iz0) continue;
+    const det = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+    if (Math.abs(det) < 1e-10) continue;
+    for (let iz = iz0; iz <= iz1; iz++) {
+      const pz = g.z0 + (iz + 0.5) * C;
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const px = g.x0 + (ix + 0.5) * C;
+        const l1 = ((bz - cz) * (px - cx) + (cx - bx) * (pz - cz)) / det;
+        const l2 = ((cz - az) * (px - cx) + (ax - cx) * (pz - cz)) / det;
+        const l3 = 1 - l1 - l2;
+        if (l1 < -0.02 || l2 < -0.02 || l3 < -0.02) continue;
+        put(ix + iz * g.nx, l1 * W[a + 1] + l2 * W[b + 1] + l3 * W[c + 1]);
+      }
+    }
+  }
+  const f = rec.pileFoot || (rec.pileFoot = { cells: null, hs: null, x: 0, y: 0, z: 0, q: [0, 0, 0, 1] });
+  f.cells = Int32Array.from(cells);
+  f.hs = new Float32Array(cells.length);
+  for (let k = 0; k < cells.length; k++) f.hs[k] = TH[cells[k]];
+  f.x = rec.pos.x;
+  f.y = rec.pos.y;
+  f.z = rec.pos.z;
+  f.q = [rec.quat.x, rec.quat.y, rec.quat.z, rec.quat.w];
+  return f;
+}
+
+/** True when a figurine's cached footprint still matches its pose (a vertical move only shifts the heights). */
+function pileFootValid(rec) {
+  const f = rec.pileFoot;
+  if (!f || !f.cells) return false;
+  const q = rec.quat;
+  return f.x === rec.pos.x && f.z === rec.pos.z && f.q[0] === q.x && f.q[1] === q.y && f.q[2] === q.z && f.q[3] === q.w;
+}
+
+/** Writes a figurine's footprint into the grid (rebuilt from its mesh when the pose changed). */
+function pileRaster(g, rec, col, W) {
+  if (!pileFootValid(rec)) pileFootprint(g, rec, col, W || pileWorld(rec, col));
+  const f = rec.pileFoot;
+  const dy = rec.pos.y - f.y;
+  const H = g.h;
+  const O = g.own;
+  for (let k = 0; k < f.cells.length; k++) {
+    const i = f.cells[k];
+    const h = f.hs[k] + dy;
+    if (h > H[i]) {
+      H[i] = h;
+      O[i] = rec.h;
+    }
+  }
+}
+
+/**
+ * Links a figurine to the figurines its points rest on: every owner of the four cells around a point (the bilinear
+ * stencil of pileH) whose surface comes within the contact tolerance. Generous on purpose: an extra link only means
+ * one more figurine to re-drop when a support is taken away; a missing one would leave a figurine hovering.
+ */
+function pileLink(g, rec, col, W) {
+  const under = new Set();
+  const C = PILE.cell;
+  for (let v = 0; v < col.n; v++) {
+    const fx = (W[v * 3] - g.x0) / C - 0.5;
+    const fz = (W[v * 3 + 2] - g.z0) / C - 0.5;
+    const ix = Math.floor(fx);
+    const iz = Math.floor(fz);
+    if (ix < 0 || iz < 0 || ix >= g.nx - 1 || iz >= g.nz - 1) continue;
+    const y = W[v * 3 + 1] - PILE.touch;
+    for (const i of [ix + iz * g.nx, ix + 1 + iz * g.nx, ix + (iz + 1) * g.nx, ix + 1 + (iz + 1) * g.nx]) {
+      const o = g.own[i];
+      if (o >= 0 && o !== rec.h && g.h[i] > y) under.add(o);
+    }
+  }
+  rec.under = [];
+  for (const h of under) {
+    const o = REC[h];
+    if (!o || o.heap !== rec.heap) continue;
+    rec.under.push(o);
+    if (!o.over.includes(rec)) o.over.push(rec);
+  }
+}
+
+/** Unlinks a figurine from the ones it rests on. */
+function pileUnlink(rec) {
+  for (const u of rec.under || []) {
+    const k = u.over.indexOf(rec);
+    if (k >= 0) u.over.splice(k, 1);
+  }
+  rec.under = [];
+}
+
+/** Candidate orientation into PILE_Q: lying (axis near horizontal, any roll), leaning (steeper) or upright. */
+function pileTurn(r, kind) {
+  const yaw = r() * Math.PI * 2;
+  if (kind === 'upright') {
+    const tilt = r() * 7 * DEG;
+    const ta = r() * Math.PI * 2;
+    PILE_U.set(Math.sin(tilt) * Math.cos(ta), Math.cos(tilt), Math.sin(tilt) * Math.sin(ta));
+    PILE_Q.setFromUnitVectors(UP_AXIS, PILE_U);
+    return PILE_Q.premultiply(PILE_Q2.setFromAxisAngle(PILE_U, yaw));
+  }
+  const pitch = (kind === 'lean' ? 22 + r() * 26 : (r() - 0.5) * 30) * DEG;
+  PILE_U.set(Math.cos(pitch) * Math.cos(yaw), Math.sin(pitch), Math.cos(pitch) * Math.sin(yaw));
+  PILE_Q.setFromUnitVectors(UP_AXIS, PILE_U);
+  return PILE_Q.premultiply(PILE_Q2.setFromAxisAngle(PILE_U, r() * Math.PI * 2));
+}
+
+/**
+ * Drops a figurine onto a pile near (x, z): tries `spots` positions within `spread` metres and `turns` orientations
+ * each (plus the current orientation when `keep`), and keeps the pose with the lowest centre of mass. The pose is
+ * applied, rasterised and linked. Returns false when no spot inside the heap fits.
+ */
+function pileDrop(rec, hp, x, z, r, opts = {}) {
+  const g = hp.grid || pileGridReset(hp);
+  const col = pileCollider(rec.id);
+  const s = rec.scale;
+  const spread = opts.spread ?? PILE.spread;
+  const spots = opts.spots ?? PILE.spots;
+  const turns = opts.turns ?? PILE.turns;
+  let best = null;
+  const bestQ = new THREE.Quaternion();
+  const tryPose = (cx, cz, q) => {
+    const m = pileMatrix(q, s);
+    const rest = pileRest(g, col, m, cx, cz, false);
+    // Lowest centre of mass wins, with two soft preferences that keep the pile readable from the aisles: lying
+    // along the mound's contour (not pointing a base bottom at the viewer) and the front facing up rather than down.
+    const e = m.elements;
+    const ax = e[3] / s;
+    const az = e[5] / s;
+    const ah = Math.hypot(ax, az);
+    let rx = cx - hp.x;
+    let rz = cz - hp.z;
+    const rl = Math.hypot(rx, rz) || 1;
+    rx /= rl;
+    rz /= rl;
+    const radial = ah > 0.3 ? Math.abs((ax * rx + az * rz) / ah) * ah : 0;
+    const faceDown = (1 - e[7] / s) * 0.5;
+    const comY = rest + pileComY(col, m) + PILE.wRadial * radial + PILE.wFace * faceDown;
+    if (!best || comY < best.comY) {
+      best = { comY, cx, cz };
+      bestQ.copy(q);
+    }
+  };
+  if (opts.keep) tryPose(rec.pos.x, rec.pos.z, rec.quat);
+  for (let p = 0; p < spots; p++) {
+    let cx = x;
+    let cz = z;
+    if (p > 0) {
+      const a = r() * Math.PI * 2;
+      const rr = Math.sqrt(r()) * spread;
+      cx += Math.cos(a) * rr;
+      cz += Math.sin(a) * rr;
+    }
+    if (heapRadius(hp, cx, cz) > 0.93) continue;
+    for (let t = 0; t < turns; t++) {
+      const roll = r();
+      const kind = rec.d.ownBase || (opts.upright && roll < 0.6) ? 'upright' : roll < 0.2 ? 'lean' : 'lying';
+      tryPose(cx, cz, pileTurn(r, kind));
+    }
+  }
+  if (!best) return false;
+  // Settle: small tips and shifts while the centre of mass still goes down (a stable rest with several contacts).
+  for (const step of [12 * DEG, 6 * DEG, 3 * DEG]) {
+    for (let iter = 0; iter < 2; iter++) {
+      const q0 = bestQ.clone();
+      const x0 = best.cx;
+      const z0 = best.cz;
+      let improved = false;
+      for (const [ax, ay, az] of PILE_NUDGE) {
+        if (ay) PILE_AX.set(0, 1, 0).applyQuaternion(q0).multiplyScalar(ay);
+        else PILE_AX.set(ax, 0, az);
+        PILE_Q3.setFromAxisAngle(PILE_AX, step).multiply(q0);
+        const before = best.comY;
+        tryPose(x0, z0, PILE_Q3);
+        if (best.comY < before - 1e-4) improved = true;
+      }
+      const d = step * 0.25;
+      for (const [dx, dz] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
+        if (heapRadius(hp, x0 + dx, z0 + dz) > 0.93) continue;
+        const before = best.comY;
+        tryPose(x0 + dx, z0 + dz, q0);
+        if (best.comY < before - 1e-4) improved = true;
+      }
+      if (!improved) break;
+    }
+  }
+  // Exact rest height from every point of the mesh, so nothing sinks into what is below.
+  const m = pileMatrix(bestQ, s);
+  const rest = pileRest(g, col, m, best.cx, best.cz, true);
+  rec.quat.copy(bestQ);
+  rec.pos.set(best.cx, rest, best.cz);
+  rec.lying = Math.abs(tv1.set(0, 1, 0).applyQuaternion(rec.quat).y) < 0.7;
+  rec.heap = WORLD.heaps.indexOf(hp);
+  rec.over = rec.over || [];
+  rec.pileSeq = opts.seq || ++PILE.seq;
+  const W = pileWorld(rec, col);
+  rec.groundY = rec.pileBottom;
+  pileLink(g, rec, col, W);
+  pileFootprint(g, rec, col, W);
+  pileRaster(g, rec, col, W);
+  if (!hp.pile.includes(rec)) hp.pile.push(rec);
+  return true;
 }
 
 /** True when another pile figurine rests on this one (it cannot be grabbed until those are taken). */
@@ -9752,19 +10136,10 @@ function isCovered(rec) {
   return rec.heap >= 0 && !!(rec.over && rec.over.length);
 }
 
-/** Lowers a pile figurine onto what is left below it, then the ones resting on it (after a removal). */
-function pileSettle(rec) {
-  let floor = pileCoreUnder(rec);
-  for (const o of rec.under) floor = Math.max(floor, o.pileTop - 0.04);
-  const dy = floor - rec.pileBottom;
-  if (dy > -0.01) return;
-  pileShift(rec, dy);
-  syncRec(rec);
-  hashUpdate(rec);
-  for (const o of rec.over) pileSettle(o);
-}
-
-/** Takes a figurine out of its heap (picked up, summoned, thrown, shelved by an elf...): the ones above settle. */
+/**
+ * Takes a figurine out of its heap (picked up, summoned, thrown, shelved by an elf...); everything that lost its
+ * support with it drops onto what is left (settleHeap): no figurine hovers.
+ */
 function leavePile(rec) {
   const hp = rec.heap >= 0 ? WORLD.heaps[rec.heap] : null;
   rec.heap = -1;
@@ -9772,285 +10147,188 @@ function leavePile(rec) {
   KIT.setBaseVisible(rec.h, true);
   const i = hp.pile.indexOf(rec);
   if (i >= 0) hp.pile.splice(i, 1);
-  for (const u of rec.under || []) {
-    const k = u.over.indexOf(rec);
-    if (k >= 0) u.over.splice(k, 1);
-  }
-  const above = rec.over || [];
-  rec.under = [];
+  pileUnlink(rec);
+  for (const o of rec.over || []) o.under = o.under.filter((x) => x !== rec);
   rec.over = [];
-  for (const o of above) {
-    const k = o.under.indexOf(rec);
-    if (k >= 0) o.under.splice(k, 1);
-    pileSettle(o);
-  }
-}
-
-/* ---- pile surface grid: placing figurines ------------------------------------------------------------- */
-
-/** Cell size of the pile surface grid (metres). */
-const PILE_CELL = 0.06;
-/** How high the figurines may pile up above the core peak. */
-const PILE_MAX_ABOVE = 0.75;
-const PILE_U = new THREE.Vector3();
-const PILE_F = new THREE.Vector3();
-const PILE_W = new THREE.Vector3();
-
-/**
- * Height grid of a pile surface: the straw core plus the top of every figurine laid on it, the figurine that raised
- * each cell (handle, -1 = straw) and the cells of standing figurines (nothing rests on a head).
- */
-function pileGrid(hp) {
-  const nx = Math.ceil((hp.rx * 2 + 0.6) / PILE_CELL);
-  const nz = Math.ceil((hp.rz * 2 + 0.6) / PILE_CELL);
-  const g = {
-    x0: hp.x - (nx * PILE_CELL) / 2, z0: hp.z - (nz * PILE_CELL) / 2, nx, nz,
-    h: new Float32Array(nx * nz), owner: new Int32Array(nx * nz).fill(-1), block: new Uint8Array(nx * nz),
-  };
-  for (let iz = 0; iz < nz; iz++) {
-    for (let ix = 0; ix < nx; ix++) {
-      const x = g.x0 + (ix + 0.5) * PILE_CELL;
-      const z = g.z0 + (iz + 0.5) * PILE_CELL;
-      g.h[ix + iz * nx] = hp.h0 * heapBell(heapRadius(hp, x, z));
-    }
-  }
-  return g;
-}
-
-/** Visits the grid cells within `rad` of (x, z): fn(index). */
-function pileCells(g, x, z, rad, fn) {
-  const ix0 = Math.max(0, Math.floor((x - rad - g.x0) / PILE_CELL));
-  const ix1 = Math.min(g.nx - 1, Math.floor((x + rad - g.x0) / PILE_CELL));
-  const iz0 = Math.max(0, Math.floor((z - rad - g.z0) / PILE_CELL));
-  const iz1 = Math.min(g.nz - 1, Math.floor((z + rad - g.z0) / PILE_CELL));
-  const r2 = rad * rad;
-  for (let iz = iz0; iz <= iz1; iz++) {
-    const cz = g.z0 + (iz + 0.5) * PILE_CELL - z;
-    for (let ix = ix0; ix <= ix1; ix++) {
-      const cx = g.x0 + (ix + 0.5) * PILE_CELL - x;
-      if (cx * cx + cz * cz <= r2) fn(ix + iz * g.nx);
-    }
-  }
-}
-
-/** Raises the grid with an existing pile figurine (its three footprint circles at its top height). */
-function pileRaster(g, rec) {
-  for (let k = 0; k < 3; k++) {
-    pileCells(g, rec.pileP[k * 2], rec.pileP[k * 2 + 1], rec.pileRho, (i) => {
-      if (rec.pileTop > g.h[i]) {
-        g.h[i] = rec.pileTop;
-        g.owner[i] = rec.h;
-      }
-      if (rec.pileUpright) g.block[i] = 1;
-    });
-  }
-}
-
-/** Grid of a pile from its current figurines (for adding one at run time). */
-function pileGridNow(hp) {
-  const g = pileGrid(hp);
-  const list = hp.pile.slice().sort((a, b) => a.pileTop - b.pileTop);
-  for (const rec of list) pileRaster(g, rec);
-  return g;
-}
-
-const PILE_S = new Float32Array(7);
-const PILE_TS = [0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6, 1];
-
-/**
- * Tries a figurine on the pile at (x, z): lying along direction `dir` (rolled `roll` away from face-up) and resting on
- * what is below it along its whole length (it leans across the figurines it lies on), or standing (only on bare
- * straw). Returns { stack, top } or null when the spot is not possible; with `commit` the pose is applied, the grid
- * raised and the figurine linked to the ones it rests on.
- */
-function pileTry(rec, hp, g, x, z, kind, dir, roll, commit) {
-  const s = rec.scale;
-  const m = rec.met;
-  const len = m.totalH * s;
-  const rho = Math.max(m.baseR, m.radius * 0.75) * s;
-  const core = hp.h0 * heapBell(heapRadius(hp, x, z));
-  if (kind === 'upright') {
-    let h = 0;
-    let busy = false;
-    pileCells(g, x, z, rho, (i) => {
-      if (g.owner[i] >= 0 || g.block[i]) busy = true;
-      h = Math.max(h, g.h[i]);
-    });
-    if (busy) return null;
-    const res = { stack: 0, top: h + len };
-    if (!commit) return res;
-    poseUpright(rec, x, h, z, dir);
-    pileExtent(rec);
-    pileRaster(g, rec);
-    rec.under = [];
-    hp.pile.push(rec);
-    KIT.setBaseVisible(rec.h, true);
-    return res;
-  }
-  const dx = Math.cos(dir);
-  const dz = Math.sin(dir);
-  let blocked = false;
-  for (let k = 0; k < 7; k++) {
-    const t = PILE_TS[k] - 0.5;
-    let h = 0;
-    pileCells(g, x + dx * len * t, z + dz * len * t, rho * 0.85, (i) => {
-      if (g.block[i]) blocked = true;
-      h = Math.max(h, g.h[i]);
-    });
-    PILE_S[k] = h;
-  }
-  if (blocked) return null;
-  // Contact line under the figure: through the high points of each half, raised to clear every sample, slope capped.
-  let sA = 0;
-  let sB = 0;
-  for (let k = 0; k <= 3; k++) sA = Math.max(sA, PILE_S[k]);
-  for (let k = 3; k < 7; k++) sB = Math.max(sB, PILE_S[k]);
-  let b = clampTo((sB - sA) * 2, -len * 0.6, len * 0.6);
-  let a = sA - 0.25 * b;
-  let lift = -1e9;
-  for (let k = 0; k < 7; k++) lift = Math.max(lift, PILE_S[k] - 0.03 - (a + b * PILE_TS[k]));
-  a += lift;
-  const top = Math.max(a, a + b) + 2 * rho;
-  const res = { stack: a + Math.min(0, b) - core, top };
-  if (!commit) return res;
-  // Pose: the axis runs from the base (t = 0) to the head (t = 1), a figure radius above the contact line.
-  const hl = Math.sqrt(Math.max(0.01, len * len - b * b));
-  PILE_U.set(dx * hl, b, dz * hl).normalize();
-  rec.quat.setFromUnitVectors(UP_AXIS, PILE_U);
-  // Roll around the axis: the front (local +Z) faces up, give or take `roll`.
-  PILE_F.set(0, 0, 1).applyQuaternion(rec.quat);
-  PILE_W.copy(UP_AXIS).addScaledVector(PILE_U, -PILE_U.y).normalize();
-  const ang = Math.atan2(PILE_F.clone().cross(PILE_W).dot(PILE_U), PILE_F.dot(PILE_W));
-  rec.quat.premultiply(tq2.setFromAxisAngle(PILE_U, ang + roll));
-  rec.pos.set(x - dx * (hl / 2), a + rho * 0.92, z - dz * (hl / 2));
-  rec.lying = true;
-  rec.groundY = a;
-  pileExtent(rec);
-  // Supports: the figurines whose top makes the contact line (within a few centimetres).
-  const under = new Set();
-  for (let k = 0; k < 7; k++) {
-    const t = PILE_TS[k] - 0.5;
-    const line = a + b * PILE_TS[k];
-    pileCells(g, x + dx * hl * t, z + dz * hl * t, rho * 0.85, (i) => {
-      if (g.owner[i] >= 0 && g.h[i] > line - 0.07) under.add(g.owner[i]);
-    });
-  }
-  rec.under = [...under].map((h) => REC[h]).filter((o) => o && o !== rec && o.heap === WORLD.heaps.indexOf(hp));
-  for (const o of rec.under) o.over.push(rec);
-  for (let k = 0; k < 7; k++) {
-    const t = PILE_TS[k] - 0.5;
-    const top = a + b * PILE_TS[k] + 2 * rho * 0.9;
-    pileCells(g, x + dx * hl * t, z + dz * hl * t, rho, (i) => {
-      if (top > g.h[i]) {
-        g.h[i] = top;
-        g.owner[i] = rec.h;
-      }
-    });
-  }
-  hp.pile.push(rec);
-  // In a pile only the figure shows: the bases' dark undersides would turn the mound into a heap of black discs.
-  KIT.setBaseVisible(rec.h, false);
-  return res;
-}
-
-/** Best of a few candidate spots near (x, z) (spread `spread` metres), then committed. Returns false if none fit. */
-function pilePlace(rec, hp, hi, g, r, x, z, spread, tries, uprightP) {
-  let best = null;
-  for (let t = 0; t < tries; t++) {
-    let cx = x;
-    let cz = z;
-    if (spread > 0) {
-      const a = r() * Math.PI * 2;
-      const rr = Math.sqrt(r()) * spread;
-      cx += Math.cos(a) * rr;
-      cz += Math.sin(a) * rr;
-    }
-    if (heapRadius(hp, cx, cz) > 0.95) continue;
-    const kind = r() < uprightP ? 'upright' : 'lying';
-    const dir = r() * Math.PI * 2;
-    const roll = (r() - 0.5) * 2.2;
-    const res = pileTry(rec, hp, g, cx, cz, kind, dir, roll, false);
-    if (!res) continue;
-    const score = res.stack + (res.top > hp.h0 + PILE_MAX_ABOVE ? 1 : 0) + r() * 0.02;
-    if (!best || score < best.score) best = { score, cx, cz, kind, dir, roll };
-  }
-  if (!best) return false;
-  rec.over = [];
-  rec.heap = hi;
-  pileTry(rec, hp, g, best.cx, best.cz, best.kind, best.dir, best.roll, true);
-  return true;
+  // Bulk removals (loading a save) leave the settling to the rebuildPiles() pass that follows.
+  if (PILE.bulk || !hp.grid || hp.crate) return;
+  settleHeap(hp, rec.pileBox ? [rec.pileBox.slice()] : null);
 }
 
 /** Adds a loose figurine to the pile around (x, z) (recovered, dropped or thrown onto a heap). */
 function joinPile(rec, hp, x, z, kind = 'lying') {
   if (rec.heap >= 0) leavePile(rec);
-  const hi = WORLD.heaps.indexOf(hp);
-  const g = pileGridNow(hp);
+  if (!hp.grid) rebuildPiles();
   rec.under = [];
   rec.over = [];
-  if (!pilePlace(rec, hp, hi, g, Math.random, x, z, 0.35, 10, kind === 'upright' ? 1 : 0)) {
-    pilePlace(rec, hp, hi, g, Math.random, x, z, 0.8, 16, 0);
-  }
-  if (rec.heap < 0) {
-    // Nowhere to rest on the pile: stand it at the foot of the heap.
+  if (!pileDrop(rec, hp, x, z, Math.random, { upright: kind === 'upright', spread: 0.3 })) {
     rec.heap = -1;
     poseUpright(rec, x, groundAt(x, z), z, Math.random() * Math.PI * 2);
   }
 }
 
 /**
- * Builds a pile from scratch (deterministic from the seeded rng): each figurine tries several spots over the whole heap
- * and takes the one where it rests lowest above the straw, so the core is covered first and the figurines then stack
- * up into a mound (about two layers).
+ * Builds a pile from scratch (deterministic from the seeded rng): every figurine is dropped from above a point near
+ * the heap's middle (normally distributed), rolls into the lowest nearby gap and rests on what is already there, so
+ * the figurines pile up into a mound; a few of the last ones stand upright on top.
  */
 function buildPile(hp, hi, list, r) {
   hp.pile = [];
-  const g = pileGrid(hp);
-  for (const rec of list) {
+  pileGridReset(hp);
+  const n = list.length;
+  list.forEach((rec, i) => {
     rec.under = [];
     rec.over = [];
     rec.state = ST.LOOSE;
-    if (!pilePlace(rec, hp, hi, g, r, hp.x, hp.z, Math.max(hp.rx, hp.rz) * 0.95, 8, 0.12)) {
-      pilePlace(rec, hp, hi, g, r, hp.x, hp.z, Math.max(hp.rx, hp.rz) * 0.95, 30, 0);
+    let ok = false;
+    for (let attempt = 0; attempt < 6 && !ok; attempt++) {
+      // Box-Muller: a normal drop point in the ellipse, sigma PILE.drop (normalised radius).
+      const u1 = Math.max(1e-6, r());
+      const u2 = r();
+      const rad = Math.min(0.85, Math.sqrt(-2 * Math.log(u1)) * PILE.drop);
+      const x = hp.x + Math.cos(u2 * Math.PI * 2) * rad * hp.rx;
+      const z = hp.z + Math.sin(u2 * Math.PI * 2) * rad * hp.rz;
+      ok = pileDrop(rec, hp, x, z, r, { upright: i > n * 0.7 && r() < PILE.upright * 3 });
     }
-    if (rec.heap !== hi) {
-      // Pile full everywhere (should not happen with the configured shares): lay it at the foot.
+    if (!ok) {
       const a = r() * Math.PI * 2;
       poseLying(rec, hp.x + Math.cos(a) * hp.rx * 1.05, 0, hp.z + Math.sin(a) * hp.rz * 1.05, a, r());
       rec.heap = -1;
-    }
-  }
+    } else rec.heap = hi;
+    KIT.setBaseVisible(rec.h, true);
+  });
 }
 
-/** Rebuilds the pile links of every heap from the figurines' current poses (after loading a save). */
-function rebuildPiles() {
-  for (const rec of REC) {
-    rec.under = [];
-    rec.over = [];
-  }
-  WORLD.heaps.forEach((hp, hi) => {
-    if (hp.crate) return;
-    const list = REC.filter((rec) => rec.heap === hi && rec.state === ST.LOOSE);
-    hp.pile = [];
+/** True when box b (x0, z0, x1, z1) overlaps any of the boxes (grown by a few centimetres). */
+function pileBoxHit(b, boxes) {
+  for (const d of boxes) if (b[0] < d[2] + 0.04 && b[2] > d[0] - 0.04 && b[1] < d[3] + 0.04 && b[3] > d[1] - 0.04) return true;
+  return false;
+}
+
+/**
+ * Rebuilds a heap's surface grid and pile links from its figurines' current poses, in the order they were dropped.
+ * A figurine that rests a little off (rounding of a saved pose, a neighbour that settled) is moved vertically onto its
+ * support; one whose support is gone (taken away, shelved, held) is set aside and dropped again afterwards, bottom
+ * first, onto what is left, so whatever rested on it follows. `dirty` (boxes) limits the checks to the figurines that
+ * can be affected (null: check all); the others are only re-stamped from their cached footprints. The result is
+ * exactly what pileAudit() measures.
+ */
+function settleHeap(hp, dirty = null) {
+  const hi = WORLD.heaps.indexOf(hp);
+  const list = REC.filter((rec) => rec.heap === hi && rec.state === ST.LOOSE);
+  hp.pile = [];
+  const g = pileGridReset(hp);
+  const boxes = dirty ? dirty.slice() : null;
+  if (!dirty) {
     for (const rec of list) {
       rec.under = [];
       rec.over = [];
-      pileExtent(rec);
-      KIT.setBaseVisible(rec.h, rec.pileUpright);
+      KIT.setBaseVisible(rec.h, true);
     }
-    list.sort((a, b) => a.pileBottom - b.pileBottom);
-    for (const rec of list) {
-      for (const o of hp.pile) {
-        if (pileOverlap(rec, o) && o.pileTop > rec.pileBottom - 0.08 && o.pileBottom < rec.pileBottom - 0.02) {
-          rec.under.push(o);
-          o.over.push(rec);
-        }
-      }
+  }
+  for (const rec of list) if (!rec.pileBox || !pileFootValid(rec)) pileWorld(rec, pileCollider(rec.id));
+  list.sort(pileOrder);
+  const lost = [];
+  for (const rec of list) {
+    if (rec.pileSeq) PILE.seq = Math.max(PILE.seq, rec.pileSeq);
+    const col = pileCollider(rec.id);
+    if (boxes && !pileBoxHit(rec.pileBox, boxes)) {
+      pileRaster(g, rec, col, null);
       hp.pile.push(rec);
+      continue;
     }
-    // Anything left hanging (it rested on a figurine that is no longer in the pile) settles down.
-    for (const rec of list) pileSettle(rec);
+    const rest = pileRest(g, col, pileMatrix(rec.quat, rec.scale), rec.pos.x, rec.pos.z, true);
+    const gap = rec.pos.y - rest;
+    if (gap > 0.03) {
+      if (boxes) boxes.push(rec.pileBox.slice());
+      pileUnlink(rec);
+      lost.push(rec);
+      continue;
+    }
+    if (Math.abs(gap) > 0.0015) {
+      if (boxes) boxes.push(rec.pileBox.slice());
+      rec.pos.y = rest;
+      syncRec(rec);
+      hashUpdate(rec);
+    }
+    pileUnlink(rec);
+    const W = pileWorld(rec, col);
+    rec.groundY = rec.pileBottom;
+    pileLink(g, rec, col, W);
+    pileRaster(g, rec, col, W);
+    hp.pile.push(rec);
+  }
+  for (const rec of lost) {
+    if (PILE.log.length < 40) PILE.log.push([rec.key, rec.pileSeq || 0]);
+    for (const o of rec.over) o.under = o.under.filter((x) => x !== rec);
+    rec.over = [];
+    pileDrop(rec, hp, rec.pos.x, rec.pos.z, Math.random, { keep: true, spots: 3, spread: 0.08, turns: 6 });
+    syncRec(rec);
+    hashUpdate(rec);
+  }
+}
+
+/** Rebuilds and settles every heap (after loading a save or spawning). */
+function rebuildPiles() {
+  for (const hp of WORLD.heaps) if (!hp.crate) settleHeap(hp);
+}
+
+/** Placement order of pile figurines (the order they were dropped; unknown ones bottom first, after the known ones). */
+function pileOrder(a, b) {
+  const sa = a.pileSeq || 0;
+  const sb = b.pileSeq || 0;
+  if (sa && sb) return sa - sb;
+  if (sa || sb) return sa ? -1 : 1;
+  return a.pileBottom - b.pileBottom;
+}
+
+/**
+ * Diagnostics: for every pile figurine the gap between its lowest-reaching point and the surface below it, built bottom
+ * first from the other figurines (as rebuildPiles does, without moving anything). Returns per-heap counts and maxima.
+ */
+function pileAudit() {
+  const out = {};
+  WORLD.heaps.forEach((hp, hi) => {
+    if (hp.crate) return;
+    const list = REC.filter((rec) => rec.heap === hi && rec.state === ST.LOOSE);
+    for (const rec of list) pileWorld(rec, pileCollider(rec.id));
+    list.sort(pileOrder);
+    const save = { h: hp.grid.h.slice(), own: hp.grid.own.slice() };
+    const g = pileGridReset(hp);
+    let worst = 0;
+    let floating = 0;
+    let sunk = 0;
+    const odd = [];
+    for (const rec of list) {
+      const col = pileCollider(rec.id);
+      const gap = rec.pos.y - pileRest(g, col, pileMatrix(rec.quat, rec.scale), rec.pos.x, rec.pos.z, true);
+      if (gap > 0.01) floating++;
+      if (gap < -0.03) sunk++;
+      if ((gap > 0.01 || gap < -0.03) && odd.length < 4) odd.push([rec.key, rec.pileSeq || 0, +gap.toFixed(3)]);
+      worst = Math.max(worst, gap);
+      pileRaster(g, rec, col, pileWorld(rec, col));
+    }
+    let top = 0;
+    const bare = [0, 0, 0, 0];
+    const cells = [0, 0, 0, 0];
+    for (let i = 0; i < g.h.length; i++) {
+      top = Math.max(top, g.h[i]);
+      const ix = i % g.nx;
+      const iz = Math.floor(i / g.nx);
+      const rr = heapRadius(hp, g.x0 + (ix + 0.5) * PILE.cell, g.z0 + (iz + 0.5) * PILE.cell);
+      if (rr >= 0.8) continue;
+      const band = Math.min(3, Math.floor(rr / 0.2));
+      cells[band]++;
+      if (g.own[i] < 0) bare[band]++;
+    }
+    g.h.set(save.h);
+    g.own.set(save.own);
+    out[hp.id] = {
+      n: list.length, covered: list.filter((x) => x.over.length).length, floating, sunk, worstGap: +worst.toFixed(4),
+      odd, top: +top.toFixed(2), bareByRadius: bare.map((b, k) => +(b / Math.max(1, cells[k])).toFixed(3)), upright: list.filter((x) => !x.lying).length,
+    };
   });
+  return out;
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -10157,9 +10435,6 @@ function spawnAll(seed) {
       });
     }
   });
-  // One consistent set of pile links from the final poses (the same pass a loaded save gets); anything the surface
-  // grid left hanging settles onto what is really below it.
-  rebuildPiles();
   // Runaway nifflers start at the foot of the heaps (round robin over the straw heaps, never in a crate).
   const piles = WORLD.heaps.filter((hp) => !hp.crate);
   for (const rec of REC) {
@@ -11657,6 +11932,8 @@ function splashHeap() {
     rec.over = [];
     KIT.setBaseVisible(rec.h, true);
   }
+  // The surface is bare straw again: the scattered figurines land on it (or on each other) afresh.
+  if (hp.grid) pileGridReset(hp);
   let simulated = 0;
   for (const rec of list) {
     const a = Math.random() * Math.PI * 2;
@@ -15393,7 +15670,7 @@ function recSaveEntry(rec) {
       p = tv5.set(tgt.x, groundAt(tgt.x, tgt.z, tgt.y + 0.05), tgt.z);
       qq = tq2.identity();
     }
-    e.push(mm(p.x), mm(p.y), mm(p.z), q4(qq.x), q4(qq.y), q4(qq.z), q4(qq.w), rec.spot ? 1 : 0, rec.heap);
+    e.push(mm(p.x), mm(p.y), mm(p.z), q4(qq.x), q4(qq.y), q4(qq.z), q4(qq.w), rec.spot ? 1 : 0, rec.heap, rec.heap >= 0 ? rec.pileSeq || 0 : 0);
   }
   return e;
 }
@@ -15575,6 +15852,8 @@ function applySaveData(d) {
   // figurines, hidden legendary copies and runaways stay where spawnAll() just put them in the new heaps, and
   // figurines the player left elsewhere stand upright at their old floor spot.
   const oldLayout = !(d.layout >= LAYOUT_VERSION);
+  // Figurines leave the freshly spawned piles in bulk here; one rebuildPiles() pass settles everything at the end.
+  PILE.bulk = true;
   const held = [];
   for (const rec of REC) {
     if (rec.actor) continue;
@@ -15625,6 +15904,7 @@ function applySaveData(d) {
       rec.quat.set(e[7] / 10000, e[8] / 10000, e[9] / 10000, e[10] / 10000).normalize();
       rec.spot = !!e[11];
       rec.heap = Number.isFinite(e[12]) ? e[12] : -1;
+      rec.pileSeq = Number.isFinite(e[13]) ? e[13] : 0;
       rec.lying = Math.abs(tv1.set(0, 1, 0).applyQuaternion(rec.quat).y) < 0.7;
       rec.groundY = rec.lying ? Math.max(0, rec.pos.y - rec.met.radius * rec.scale) : rec.pos.y;
       if (s === STATE_CODE.wild && rec.wild && rec.wild.kind === 'scurrier') {
@@ -15650,6 +15930,7 @@ function applySaveData(d) {
     pushStack(rec);
   }
   // Pile links follow the restored poses (old layouts: figurines that rested on shelved or held ones settle down).
+  PILE.bulk = false;
   rebuildPiles();
   if (GAME.snitch.caught && SNITCH.rec && SNITCH.rec.state === ST.HIDDEN && !held.some(([, r]) => r === SNITCH.rec)) {
     // The caught Snitch was shelved or dropped; nothing else to do.
@@ -16369,7 +16650,7 @@ const DEBUG_API = {
   },
   /** Live engine objects for automated diagnostics (not used by the game itself). */
   internals() {
-    return { THREE, scene, camera, renderer, kit, composer, GAME, REC, WORLD, SNITCH, SETTINGS, MENU, LOOP, PLATES, slotPlateState, leavePile };
+    return { THREE, scene, camera, renderer, kit, composer, GAME, REC, WORLD, SNITCH, SETTINGS, MENU, LOOP, PLATES, slotPlateState, leavePile, PILE };
   },
   /** Stands about `dist` metres from a world point on free floor and looks at it (Snitch, interactables, spots). */
   aimPoint(x, y, z, dist = 1.1) {
@@ -16394,6 +16675,10 @@ const DEBUG_API = {
     storeSettings();
     applyQuality();
     return SETTINGS.quality;
+  },
+  /** Pile diagnostics: per heap counts, floating / sunk figurines and the largest support gap (metres). */
+  pileAudit() {
+    return pileAudit();
   },
   /** Text size setting (1.0–2.0), as the settings menu applies it. */
   setTextSize(v) {

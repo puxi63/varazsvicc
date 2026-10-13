@@ -476,6 +476,9 @@ function figBuildBase(lod) {
       [FIG_LACQUER, 0.22, 0, 1, 0, [[2.66, 1.8], [0.0, 1.8]]],
     ];
   for (const [hex, rough, metal, coat, flag, pts] of bands) P.add(figLathe(S(pts), segs), hex, rough, metal, coat, flag);
+  // Underside in the category's enamel colour (flag 255, like the ring band): seen end-on in the figurine piles it is a
+  // bright, sortable colour cue instead of a dark hole.
+  P.add(figLathe(S([[0.0, 0.0], [3.3, 0.0]]), segs), 0xffffff, 0.6, 0, 0, 255);
   if (lod < 2) {
     /* Medallion: gilt rim and a lacquer field whose symbol comes from the atlas (flag 128) */
     const ms = lod === 0 ? 28 : 14;
