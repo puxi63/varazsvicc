@@ -219,6 +219,8 @@ button { font: inherit; color: inherit; }
 .pad.trig { border-radius: 0.9vh 0.9vh 0.5vh 0.5vh; width: auto; padding: 0 0.8vh; min-width: calc(4.4vh * var(--ts)); font-size: var(--fs-glyph); }
 .pad.bump { border-radius: 1.6vh 1.6vh 0.4vh 0.4vh; width: auto; padding: 0 0.8vh; min-width: calc(4.4vh * var(--ts)); font-size: var(--fs-glyph); }
 .pad.stick { border-radius: 50%; box-shadow: inset 0 0 0 0.35vh var(--shade-55), 0 1px 2px var(--shade-65); font-size: calc(var(--fs-glyph) * 0.92); }
+/* Held-in stick (zoom): a gold ring marks "keep it pressed". */
+.pad.stick.hold { box-shadow: inset 0 0 0 0.35vh var(--shade-55), 0 0 0 0.3vh var(--gold-hi), 0 1px 2px var(--shade-65); }
 .pad.menubtn, .pad.dpad { border-radius: 0.6vh; width: calc(3.8vh * var(--ts)); }
 .pad svg { width: 74%; height: 74%; }
 .pad .glyph { fill: none; stroke: var(--pad-glyph); stroke-width: 2.4; stroke-linecap: round; }
@@ -263,7 +265,7 @@ button { font: inherit; color: inherit; }
 .save-ind.fade { opacity: 0; }
 .pause-hint { display: inline-flex; align-items: center; gap: 0.8vh; font: 600 var(--fs-small)/1 var(--font-body); color: var(--text-dim); text-shadow: 0 1px 2px var(--black); }
 
-/* Crosshair and parchment hover card (left of the crosshair) */
+/* Crosshair and parchment hover card (at the left safe edge, well away from the crosshair) */
 .crosshair {
   left: 50%; top: 50%; width: 0.9vh; height: 0.9vh; margin: -0.45vh 0 0 -0.45vh; border-radius: 50%;
   background: var(--cross); box-shadow: 0 0 0 0.3vh var(--shade-35), 0 0 1.2vh var(--cross-glow);
@@ -277,10 +279,11 @@ button { font: inherit; color: inherit; }
 .floater.go { animation: floatUp 1.1s ease-out forwards; }
 @keyframes floatUp { 0% { opacity: 0; transform: translate(1.6vh, -3vh); } 15% { opacity: 1; } 100% { opacity: 0; transform: translate(1.6vh, -11vh); } }
 .tooltip {
-  /* Larger text sizes lift the card and cap its height so it never runs into the spell medals (bottom left). */
-  right: calc(50% + 3.6vh); top: calc(50% - 12vh - 10vh * (var(--ts) - 1)); box-sizing: border-box;
-  display: flex; flex-direction: column; max-height: calc(51vh - 7.5vh * var(--ts) - var(--safe-y));
-  width: min(calc(52vh * var(--ts)), calc(45vw - 6vh)); padding: 1.8vh 2.3vh 1.6vh;
+  /* Docked at the left TV-safe margin, between the galleon panel (top left) and the spell medals (bottom left):
+     layoutHoverCard() measures both and sets --card-top / --card-maxh; the calc() values are only the fallback. */
+  left: var(--safe-x); top: var(--card-top, calc(50% - 12vh - 10vh * (var(--ts) - 1))); box-sizing: border-box;
+  display: flex; flex-direction: column; max-height: var(--card-maxh, calc(51vh - 7.5vh * var(--ts) - var(--safe-y))); overflow: hidden;
+  width: min(calc(46vh * var(--ts)), 33vw); padding: 1.8vh 2.3vh 1.6vh;
   color: var(--ink); background-color: var(--parchment);
   background-image: var(--noise), radial-gradient(ellipse 120% 95% at 28% 18%, var(--parchment-hi), var(--parchment) 55%, var(--parchment-lo) 100%);
   background-size: 180px 180px, 100% 100%; background-blend-mode: soft-light, normal;
@@ -290,7 +293,6 @@ button { font: inherit; color: inherit; }
 }
 .tooltip.show { opacity: 1; transform: translateY(0) rotate(0.4deg); }
 .tooltip > * { flex: none; }
-.tooltip::before { content: ""; position: absolute; right: -1.1vh; top: calc(11.8vh + 10vh * (var(--ts) - 1)); width: 2vh; height: 2vh; transform: rotate(45deg); background: var(--parchment); border-top: 1px solid var(--ink-line); border-right: 1px solid var(--ink-line); }
 .tt-kicker { font: 400 var(--fs-small)/1.2 var(--font-fun); letter-spacing: 0.1em; text-transform: uppercase; color: var(--magenta-ink); }
 .tt-kicker.bad { color: var(--wrong); }
 .tt-title { margin: 0.4vh 0 0.8vh; font: 400 var(--fs-head)/1.06 var(--font-display); color: var(--ink); text-wrap: balance; }
@@ -685,26 +687,31 @@ const SHOP_WINDOWS = [
 for (const w of SHOP_WINDOWS) w.top = w.spring + w.hw;
 const SHOP_DOOR = { minX: 0.4, maxX: 1.6, h: 2.75 };
 
-/** Category key → shelving unit (centre of the front plane, facing). */
+/**
+ * Category key → shelving unit: the wall it stands against, its order along that wall and how many slot columns it has
+ * (the number of levels follows from the category's design count). layoutShelves() (41-world-props.js) sizes every unit
+ * from its figurines (FIG_SCALE) and fills in x / z (centre of the front plane); `yaw` is the facing.
+ */
 const UNIT_LAYOUT = {
-  gryffindor: { x: -6.3, z: -5.6, yaw: 0 },
-  slytherin: { x: -4.5, z: -5.6, yaw: 0 },
-  ravenclaw: { x: -2.7, z: -5.6, yaw: 0 },
-  hufflepuff: { x: -0.9, z: -5.6, yaw: 0 },
-  creatures: { x: -7.6, z: -3.4, yaw: Math.PI / 2 },
-  pets: { x: -7.6, z: -1.4, yaw: Math.PI / 2 },
-  ghosts_elves: { x: -7.6, z: 0.6, yaw: Math.PI / 2 },
-  magical_objects: { x: 7.6, z: -3.4, yaw: -Math.PI / 2 },
-  quidditch: { x: 7.6, z: -1.4, yaw: -Math.PI / 2 },
-  hallows_horcruxes: { x: 7.6, z: 0.6, yaw: -Math.PI / 2 },
+  gryffindor: { wall: 'back', order: 0, cols: 2, x: 0, z: 0, yaw: 0 },
+  slytherin: { wall: 'back', order: 1, cols: 2, x: 0, z: 0, yaw: 0 },
+  ravenclaw: { wall: 'back', order: 2, cols: 2, x: 0, z: 0, yaw: 0 },
+  hufflepuff: { wall: 'left', order: 0, cols: 2, x: 0, z: 0, yaw: Math.PI / 2 },
+  creatures: { wall: 'left', order: 1, cols: 2, x: 0, z: 0, yaw: Math.PI / 2 },
+  pets: { wall: 'left', order: 2, cols: 1, x: 0, z: 0, yaw: Math.PI / 2 },
+  ghosts_elves: { wall: 'left', order: 3, cols: 2, x: 0, z: 0, yaw: Math.PI / 2 },
+  magical_objects: { wall: 'right', order: 0, cols: 2, x: 0, z: 0, yaw: -Math.PI / 2 },
+  quidditch: { wall: 'right', order: 1, cols: 2, x: 0, z: 0, yaw: -Math.PI / 2 },
+  hallows_horcruxes: { wall: 'right', order: 2, cols: 2, x: 0, z: 0, yaw: -Math.PI / 2 },
 };
-const UNIT = {
-  width: 1.4, depth: 0.38, top: 1.74, plinth: 0.1, side: 0.05, board: 0.03,
-  levels: [0.45, 0.77, 1.09, 1.41], slotX: [-0.33, 0.33], slotW: 0.62, clear: 0.29,
-  signY: 2.2, signW: 1.6, signH: 0.48,
-};
-/** Slot order within a unit: top level first, left before right. */
-const UNIT_SLOT_ORDER = [[3, 0], [3, 1], [2, 0], [2, 1], [1, 0], [1, 1], [0, 0], [0, 1]];
+/** Free span of each wall for the units (x along the back wall, z along the side walls, from the back corner). */
+const UNIT_WALLS = { back: { from: -7.35, to: -0.2 }, left: { from: -5.35, to: 2.15 }, right: { from: -4.1, to: 2.15 } };
+/**
+ * Shelving carpentry. Every slot holds the ten copies of one design in three staggered rows (4 + 3 + 3); the slot
+ * width, the level clearance (the unit's tallest design), the unit width, depth, height and sign position are derived
+ * per unit in layoutShelves() and kept in WORLD.units[key].dims. `depth` becomes the common depth of all units.
+ */
+const UNIT = { depth: 0.68, plinth: 0.1, side: 0.05, board: 0.03, divider: 0.02, firstLevel: 0.13, signW: 1.6, signH: 0.48 };
 
 const TOWER = {
   x: 0, z: -1.6, coreR: 0.42, outerR: 0.95, rings: [0.40, 0.80, 1.18], topY: 1.86, slotR: 0.72, spread: 0.42,
@@ -735,22 +742,25 @@ const DISPLAY_BOXES = [
   { minX: 3.8, maxX: 6.2, minZ: 5.45, maxZ: 5.9, top: 0.96 },
 ];
 
-/** Heaps and crates; quotas are fractions of the spawn pool (scaled from the design's 71/58/44/44/40/24/20/16). */
-/** Height of the straw dome relative to a heap's h0; the collision height field uses the same profile, so
- *  figurines rest on the visible straw instead of hovering above it. */
-const HEAP_MOUND_K = 0.7;
-
+/**
+ * Heaps: big elliptical mounds of figurines (radii rx / rz) on a bell-shaped straw core `core` metres high, with the
+ * figurines piled on it about one and a half layers deep, so the top reaches about chest height. The player walks
+ * around them (an elliptical collider covers the inner `HEAP_SOLID` part) and grabs the uncovered ones. Quotas are
+ * shares of the spawn pool; the crates take a small share each (the large figurines fill a crate quickly).
+ */
 const HEAP_DEFS = [
-  { id: 'H1', x: -4.0, z: -2.6, r: 1.1, share: 71 },
-  { id: 'H2', x: 3.8, z: -3.0, r: 1.0, share: 58 },
-  { id: 'H3', x: -4.8, z: 0.4, r: 0.9, share: 44 },
-  { id: 'H4', x: 4.8, z: 0.4, r: 0.9, share: 44 },
-  { id: 'H5', x: 1.6, z: 3.3, r: 0.85, share: 40 },
+  { id: 'H1', x: -4.2, z: -1.35, rx: 1.55, rz: 2.0, core: 0.6, share: 40 },
+  { id: 'H2', x: 4.25, z: -1.2, rx: 1.55, rz: 2.0, core: 0.6, share: 38 },
+  { id: 'H3', x: 1.75, z: 3.2, rx: 1.0, rz: 0.95, core: 0.4, share: 13 },
 ];
+/** Normalised heap radius inside which the pile is solid for the player. */
+const HEAP_SOLID = 0.72;
+/** Save layout generation: saves from older layouts keep their shelves and stack, loose heap figurines are re-spawned. */
+const LAYOUT_VERSION = 2;
 const CRATE_DEFS = [
-  { id: 'C1', minX: 6.8, maxX: 7.6, minZ: -7.8, maxZ: -7.0, share: 24 },
-  { id: 'C2', minX: 3.4, maxX: 4.2, minZ: -7.6, maxZ: -6.8, share: 20 },
-  { id: 'C3', minX: 2.8, maxX: 3.6, minZ: 4.3, maxZ: 4.9, share: 16 },
+  { id: 'C1', minX: 6.8, maxX: 7.6, minZ: -7.8, maxZ: -7.0, share: 1.6 },
+  { id: 'C2', minX: 3.4, maxX: 4.2, minZ: -7.6, maxZ: -6.8, share: 1.4 },
+  { id: 'C3', minX: 2.8, maxX: 3.6, minZ: 4.3, maxZ: 4.9, share: 1.2 },
 ];
 const CRATE_H = 0.55;
 
@@ -766,6 +776,8 @@ const UNIQUE_SPOTS = {
   sorting_hat: [COAT_STAND.x, COAT_STAND.shelf, COAT_STAND.z],
   elder_wand: [4.0, 0.95, -9.5],
 };
+/** Card 1 rests on the Griffendél unit's cornice and the 4th Snitch perch on the Kviddics unit: layoutShelves() moves both
+ *  with their unit. */
 const CARD_SPOTS = [
   [-6.75, 1.845, -5.75, 0.3], [-2.6, 0.965, 5.66, 2.6], [-2.6, 0.34, 1.4, 1.0], [2.2, 1.375, -5.75, 0.2], [3.5, 0.75, 1.9, -0.6],
   [4.7, 0.955, -9.45, 0.1], [3.2, 0.565, 4.6, 1.9], [5.6, 0.965, 5.66, -2.9], [-7.82, 1.305, 4.6, 1.57], [0.35, 1.805, -1.4, 0.8],
@@ -773,9 +785,10 @@ const CARD_SPOTS = [
 const SNITCH_PERCHES = [
   [-0.5, 1.9, -1.6], [-2.6, 1.3, 1.4], [-5.6, 1.3, 3.6], [7.62, 1.84, -1.4], [COAT_STAND.x, 1.97, COAT_STAND.z], [2.3, 1.42, -5.78], [5.9, 1.9, -8.6],
 ];
+/** Free floor around the heaps and in the aisles (the first five are the spots nearest each heap's foot). */
 const NIFFLER_WAYPOINTS = [
-  [-4.0, -2.6], [3.8, -3.0], [-4.8, 0.4], [4.8, 0.4], [1.6, 3.3],
-  [-2.2, -4.2], [2.2, -4.3], [-6.2, -0.4], [6.2, -0.4], [-1.0, 0.6], [1.2, 0.4], [-3.5, 3.2], [4.4, 2.8],
+  [-4.2, -3.8], [4.25, -3.65], [-4.2, 1.6], [4.3, 1.5], [0.3, 2.7],
+  [-2.0, -4.3], [2.0, -4.3], [-6.55, -1.4], [6.55, -1.2], [-1.6, 0.5], [1.5, 0.3], [-3.5, 3.0], [4.4, 2.8],
 ];
 const START_POSE = { x: 1.0, z: 4.9, yaw: 0, pitch: -0.12 };
 const FINALE_PATH = [
@@ -813,7 +826,18 @@ const BOON_COLORS = {
 /* ------------------------------------------------------------------------------------------------
    Interaction tuning
    ------------------------------------------------------------------------------------------------ */
-const STACK_VIEW = { x: 0.17, y: -0.16, z: -0.36, topScale: 0.45, scale: 0.32, gap: 0.035, shown: 6 };
+/**
+ * Held figurines, in camera-local metres (inside the 0.3 m collision radius, so they never sink into furniture): the
+ * selected (top) one is a large, slowly turning view model in the lower right of the view, normalised to `topH` tall
+ * (tower statuettes keep their relative size); the others wait hidden just below the view (`waitY`), so the next one
+ * rises into the hand. A picked figurine flies to the hand in `flyS`, a cycled one in `swapS`.
+ */
+const STACK_VIEW = { x: 0.094, y: -0.098, z: -0.235, topH: 0.17, minS: 0.2, maxS: 1.3, spin: 0.55, tilt: 0.16, waitY: -0.21, waitH: 0.05, flyS: 0.34, swapS: 0.24 };
+/** Aim highlight: how far the targeted figurine pops up (metres) on a heap or floor, and on a shelf. */
+const HILITE = { lift: 0.07, liftShelf: 0.02, inS: 0.16, outS: 0.22 };
+/** Hold-to-zoom (binocular): ease time of the view narrowing, and how long the right stick click / middle mouse button
+ *  must be held to zoom (a shorter click stays the flourish). */
+const ZOOM_TUNE = { easeS: 0.2, holdS: 0.18 };
 const INTERACT_R = 1.8;
 const INTERACT_COS = Math.cos(THREE.MathUtils.degToRad(35));
 const PHYS = { g: 9.81, drag: 0.1, restitution: 0.35, friction: 0.6, maxSim: 80, settleSpeed: 0.3 };
@@ -925,6 +949,7 @@ const TXT = {
   promptCatch: 'Elkap',
   promptAdjust: 'Állítás',
   promptTabs: 'Lapok',
+  promptZoom: 'Nagyítás',
 
   useLectern: 'Varázslatpult',
   useCauldron: 'Szerencseüst ({n} galleon)',
@@ -1014,7 +1039,7 @@ const TXT = {
   toastHonor: 'A saját figurád a díszhelyre került.',
 
   tipPick: 'Nézz egy figurára, és vedd fel: {glyph}',
-  tipCarry: 'A kezedben lévő figurák a kép jobb alsó részén lebegnek. A legfelsőt rakod le először.',
+  tipCarry: 'A kezedben lévő legfelső figura nagyban, lassan forogva látszik a kép jobb alsó részén – ezt rakod le először. A többit a mellette lévő lista mutatja.',
   tipPlace: 'Menj a figura polcához, nézz a névtáblája fölé, és rakd le: {glyph}',
   tipSign: 'A polcok feletti tábla mutatja a csoport nevét és jelét. A talapzat zománcgyűrűjének színe is segít.',
   tipWrong: 'A piros névtábla azt jelzi, hogy rossz helyre került egy figura. Vedd fel újra, és vidd a jó polcra.',
@@ -1029,6 +1054,7 @@ const TXT = {
   tipTower: 'A címerállatok a Házkupa-torony saját házuk felőli oldalára kerülnek: alulra a nagyok, felülre a kicsik.',
   tipSpells: 'A bűbájokat így használhatod: {glyph}. A gomb melletti kör mutatja, mikor töltődnek fel újra.',
   tipElves: 'A házimanók mostantól időnként egy-egy figurát a helyére varázsolnak.',
+  tipZoom: 'Messze van egy figura? Tartsd nyomva {glyph}, és ráközelítesz, mint egy távcsővel.',
 
   pauseTitle: 'Szünet',
   pauseResume: 'Folytatás',
@@ -1142,7 +1168,7 @@ const TXT = {
   ctlMenus: 'Menükben: irányítókereszt vagy bal kar a lépkedéshez, A a kiválasztáshoz, B a visszalépéshez.',
   ctl: {
     walk: 'Séta (benyomva: futás be/ki)',
-    look: 'Körbenézés (benyomva: fricska)',
+    look: 'Körbenézés (benyomva: pálcasuhintás, nyomva tartva: nagyítás)',
     pick: 'Felvesz',
     place: 'Elhelyez (polchelyre vagy a padlóra)',
     throw: 'Dob (nyomva tartva célzol, felengedve dobsz)',
@@ -1158,6 +1184,7 @@ const TXT = {
     arrows: 'Nézet forgatása, ha az egér nem rögzíthető',
     run: 'Futás be/ki',
     flourish: 'Pálcasuhintás',
+    zoom: 'Nagyítás (nyomva tartva, mint egy távcső)',
     unused: 'A Nézet és az Xbox gombot a játék nem használja.',
   },
 
@@ -1172,6 +1199,7 @@ const TXT = {
   setDeadR: 'Holtjáték – jobb kar',
   setAssist: 'Célzássegítés',
   setAssistValues: ['Erős', 'Közepes', 'Ki'],
+  setZoom: 'Nagyítás',
   setFov: 'Látószög',
   setBob: 'Fejmozgás járás közben',
   setRumble: 'Rezgés',
@@ -1195,6 +1223,7 @@ const TXT = {
   setFsAction: 'Be- és kikapcsolás',
   setDesc: {
     sensitivity: 'Milyen gyorsan fordul a nézet a jobb karral vagy az egérrel.',
+    zoomFov: 'Nyomva tartott Z billentyűvel, középső egérgombbal vagy benyomva tartott jobb karral a nézet távcsőként ráközelít, és közben lassabban fordul. Kisebb szög: erősebb nagyítás.',
     invertY: 'Felfelé nyomott karral lefelé nézel.',
     deadL: 'Ekkora karkitérésig nem mozdulsz. Növeld, ha a kar elengedése után is tovább sétálsz.',
     deadR: 'Ekkora karkitérésig nem fordul a nézet.',
@@ -1328,6 +1357,12 @@ const smooth = (a, b, x) => {
 const lerp = (a, b, t) => a + (b - a) * t;
 const easeInOut = (t) => t * t * (3 - 2 * t);
 const easeOutCubic = (t) => 1 - (1 - t) * (1 - t) * (1 - t);
+/** Ease out with a small overshoot (about 8 %) before settling: a "pop". */
+const easeOutBack = (t) => {
+  const c = 1.4;
+  const u = t - 1;
+  return 1 + (c + 1) * u * u * u + c * u * u;
+};
 const DEG = Math.PI / 180;
 
 /* Scratch objects (module level, so the frame loop allocates nothing). */
@@ -1503,8 +1538,14 @@ function hexAlpha(hex, a) {
 /* ---- 20-figures-data.js ---- */
 /* ==== 20-figures-data.js — figurine data: categories, symbols and the 76 designs (generated by tools/figbake/gen-data.mjs from spec/figure-catalog.json; edit the generator, not this file) ==== */
 
+/**
+ * Display scale of every figurine (procedural, baked, external models and their bases). The one central size knob:
+ * 1.0 = the original ~12 cm statuettes; 2.7 = about 35 cm plus the base, "Sort Them Ducks" size (user feedback 2026-10-13).
+ * Everything that depends on figure size (slots, shelves, heaps, picking, the held view) derives from the metrics.
+ */
+const FIG_SCALE = 2.7;
 /** Metres per catalog millimetre (DESIGN.md 16.5) and per bake centimetre (the baked figures are modelled in cm). */
-const FIG_MM = 0.0012;
+const FIG_MM = 0.0012 * FIG_SCALE;
 const FIG_CM = 10 * FIG_MM;
 /** Height of the round display base in metres (the figure stands on its top). */
 const FIG_BASE_H = 1.5 * FIG_CM;
@@ -2064,7 +2105,7 @@ function getFigureMetrics(designId) {
   const figH = hCm * FIG_CM;
   const totalH = baseH + figH;
   const radius = Math.max(baseR, rCm * FIG_CM);
-  const pickR = Math.max(0.05, Math.min(0.12, 0.5 * Math.hypot(totalH, radius * 2)));
+  const pickR = Math.max(0.05 * FIG_SCALE, Math.min(0.12 * FIG_SCALE, 0.5 * Math.hypot(totalH, radius * 2)));
   const res = { totalH, figH, baseR, baseH, radius, centerY: totalH * 0.5, pickR };
   figMetricsCache[designId] = res;
   return res;
@@ -2123,11 +2164,23 @@ function figSymbolAtlas() {
 /* ---- 23-figures-mat.js ---- */
 /* ==== 23-figures-mat.js — figure materials: the shared painted-resin material (TECHNIQUE.md 10), the ghost material
    and the base material (category enamel band + embossed-looking gold symbol from the atlas). All read the packed
-   attributes; per instance `figInst` = (unused, Lumos glow, flash, shelf shimmer). ==== */
+   attributes; per instance `figInst` = (aim rim highlight, Lumos glow, flash, shelf shimmer). ==== */
 
 const FIG_MATERIALS = {};
 /** Shared uniforms: animation time (shimmer) and the ghost opacity. */
 const FIG_UNIFORMS = { time: { value: 0 }, ghostAlpha: { value: 1 } };
+
+/**
+ * Aim highlight (figInst.x, 0..1): a warm fresnel rim that reads as a glowing outline, plus a slight overall lift so
+ * the targeted figurine stands out in a heap. Inserted after <emissivemap_fragment>, where `normal` is final.
+ */
+const FIG_RIM_GLSL = [
+  'if (vFigInst.x > 0.001) {',
+  '  float figRimF = 1.0 - clamp(abs(dot(normalize(normal), normalize(vViewPosition))), 0.0, 1.0);',
+  '  float figRim2 = figRimF * figRimF;',
+  '  totalEmissiveRadiance += vFigInst.x * vec3(1.0, 0.74, 0.28) * (0.03 + 0.35 * figRim2 + 0.9 * figRim2 * figRim2);',
+  '}',
+].join('\n');
 
 const FIG_SHADER_VERT_HEAD = [
   'attribute vec2 aOct;',
@@ -2251,6 +2304,7 @@ function figPatchMaterial(mat, kind) {
         kind === 'ghost' ? 'totalEmissiveRadiance += figLin * 0.22;' : '',
         'totalEmissiveRadiance += vFigInst.y * vec3(1.0, 0.82, 0.45) * 0.55 + vFigInst.z * vec3(1.2);',
         'totalEmissiveRadiance += vFigInst.w * vec3(1.0, 0.78, 0.35) * 0.6 * (0.5 + 0.5 * sin(uFigTime * 6.0 + vViewPosition.y * 40.0));',
+        FIG_RIM_GLSL,
       ].join('\n'));
     if (kind === 'ghost') {
       sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>', [
@@ -2263,7 +2317,7 @@ function figPatchMaterial(mat, kind) {
       ].join('\n'));
     }
   };
-  mat.customProgramCacheKey = () => `fig-packed-${kind}-v1`;
+  mat.customProgramCacheKey = () => `fig-packed-${kind}-v2`;
   return mat;
 }
 
@@ -2287,6 +2341,51 @@ function figGhostDepthMaterial() {
     FIG_MATERIALS.ghostDepth = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, transparent: true, side: THREE.FrontSide });
   }
   return FIG_MATERIALS.ghostDepth;
+}
+
+/**
+ * Aim outline: an inverted hull of the packed figure / base geometry (front faces culled), pushed out along the
+ * screen-space normal by a constant width and a hair behind the figure in depth, so only a glowing band around the
+ * silhouette shows. Drawn in the transparent list after the ghost passes (their depth pre-pass hides the hull inside
+ * translucent figures). uAmount fades it in and out.
+ */
+function figOutlineMaterial() {
+  if (!FIG_MATERIALS.outline) {
+    FIG_MATERIALS.outline = new THREE.ShaderMaterial({
+      uniforms: { uColor: { value: new THREE.Color(1.25, 0.92, 0.36) }, uAmount: { value: 0 }, uWidth: { value: 0.0072 } },
+      vertexShader: [
+        'attribute vec2 aOct;',
+        'uniform float uWidth;',
+        'vec3 figOctDecode(vec2 e) {',
+        '  vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));',
+        '  if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);',
+        '  return normalize(v);',
+        '}',
+        'void main() {',
+        '  mat3 im = mat3(instanceMatrix);',
+        '  vec3 n = figOctDecode(aOct) / vec3(dot(im[0], im[0]), dot(im[1], im[1]), dot(im[2], im[2]));',
+        '  vec3 vn = normalMatrix * (im * n);',
+        '  vec4 clip = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(position, 1.0);',
+        '  vec2 d = vn.xy;',
+        '  float l = length(d);',
+        '  d = l > 1e-5 ? d / l : vec2(0.0);',
+        '  d.x *= projectionMatrix[0][0] / projectionMatrix[1][1];',
+        '  clip.xy += d * uWidth * clip.w;',
+        '  clip.z += 0.0004 * clip.w;',
+        '  gl_Position = clip;',
+        '}',
+      ].join('\n'),
+      fragmentShader: [
+        'uniform vec3 uColor;',
+        'uniform float uAmount;',
+        'void main() {',
+        '  gl_FragColor = vec4(uColor, uAmount);',
+        '}',
+      ].join('\n'),
+      side: THREE.BackSide, transparent: true, depthWrite: false, depthTest: true, fog: false, toneMapped: false,
+    });
+  }
+  return FIG_MATERIALS.outline;
 }
 
 /** DESIGN.md 16.5: creates the shared materials once. Keys: figure, figureKit, glass, glassKit, base. */
@@ -2327,7 +2426,9 @@ function figPbrByte(m, back) {
    - near and mid instances are CPU frustum-culled and written into one InstancedMesh per design and LOD (draw calls =
      designs in view), plus one base InstancedMesh per LOD;
    - far instances (and their bases) live in one CPU-transformed batch mesh (1 draw, 2 with ghosts): a handle's slot is
-     rewritten only when it enters the far range or moves while far. ==== */
+     rewritten only when it enters the far range or moves while far;
+   - the aim highlight (setRim) is a per-instance rim glow in figInst.x; a highlighted handle never drops to the far
+     batch, so its glow is always drawn. ==== */
 
 const figM1 = new THREE.Matrix4();
 const figM2 = new THREE.Matrix4();
@@ -2457,12 +2558,16 @@ function figCreateFarBatch(material, slots, n) {
     has(h) {
       return slotOf[h] >= 0;
     },
-    /** Writes handle h with world matrix hm (pose space -> world) and fx bytes. */
-    write(h, hm, glow, flash, shimmer) {
+    /** Writes handle h with world matrix hm (pose space -> world) and fx bytes; noBase collapses its base part. */
+    write(h, hm, glow, flash, shimmer, noBase = false) {
       const si = slotOf[h];
       if (si < 0) return;
       const s = slots[si];
       for (const p of s.parts) {
+        if (noBase && p.ring) {
+          pos.fill(0, p.start * 3, (p.start + p.src.pos.length / 3) * 3);
+          continue;
+        }
         figM1.multiplyMatrices(hm, p.local);
         const e = figM1.elements;
         const src = p.src;
@@ -2550,7 +2655,7 @@ function figPatchExternal(mat) {
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFigInst = figInst;');
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', '#include <common>\nvarying vec4 vFigInst;\nuniform float uFigTime;')
-      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vFigInst.y * vec3(1.0, 0.82, 0.45) * 0.55 + vFigInst.z * vec3(1.2) + vFigInst.w * vec3(1.0, 0.78, 0.35) * 0.6 * (0.5 + 0.5 * sin(uFigTime * 6.0 + vViewPosition.y * 40.0));');
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${FIG_RIM_GLSL}\ntotalEmissiveRadiance += vFigInst.y * vec3(1.0, 0.82, 0.45) * 0.55 + vFigInst.z * vec3(1.2) + vFigInst.w * vec3(1.0, 0.78, 0.35) * 0.6 * (0.5 + 0.5 * sin(uFigTime * 6.0 + vViewPosition.y * 40.0));`);
   };
   mat.customProgramCacheKey = () => `fig-ext-${mat.uuid}`;
   mat.needsUpdate = true;
@@ -2593,7 +2698,7 @@ function createFigureKit(scene, designOf, opts = {}) {
     designIdx[h] = r.index;
     r.handles.push(h);
   }
-  const quality = { q: opts.quality || 'magas', dist: opts.quality === 'xbox' ? 1 : 1.3 };
+  const quality = { q: opts.quality || 'magas', dist: opts.quality === 'xbox' ? 1 : 1.3, zoom: 1 };
   const mode = new Uint8Array(n);
   const hm = new Float32Array(n * 16);
   const pos = new Float32Array(n * 3);
@@ -2601,6 +2706,7 @@ function createFigureKit(scene, designOf, opts = {}) {
   const scl = new Float32Array(n).fill(1);
   const poseDirty = new Uint8Array(n).fill(1);
   const fx = new Float32Array(n * 2);
+  const rim = new Float32Array(n);
   const fxDirty = new Uint8Array(n);
   const baseOn = new Uint8Array(n).fill(1);
   const lod = new Int8Array(n).fill(-1);
@@ -2677,6 +2783,18 @@ function createFigureKit(scene, designOf, opts = {}) {
   });
   const baseLocal = new THREE.Matrix4();
 
+  /* Aim outline: the inverted hull of the one highlighted handle (figure and base; 2 draws only while aiming) */
+  const outline = [0, 1].map((k) => {
+    const m = new THREE.InstancedMesh(new THREE.BufferGeometry(), figOutlineMaterial(), 1);
+    m.name = `fig:outline:${k}`;
+    m.frustumCulled = false;
+    m.matrixAutoUpdate = false;
+    m.renderOrder = 3;
+    m.visible = false;
+    group.add(m);
+    return m;
+  });
+
   /* Warm-up meshes: one per program, always visible with count 0, so compileAsync compiles every variant */
   const warm = [FIG_MATERIALS.figurePhys, FIG_MATERIALS.figureStd, FIG_MATERIALS.glass, FIG_MATERIALS.basePhys, FIG_MATERIALS.baseStd].map((mat) => {
     const isBase = mat === FIG_MATERIALS.basePhys || mat === FIG_MATERIALS.baseStd;
@@ -2689,6 +2807,11 @@ function createFigureKit(scene, designOf, opts = {}) {
     group.add(m);
     return m;
   });
+  const warmOutline = figInstanced(figInstGeometry(figBuildBase(2).geometry, { figInst: figInstAttr(1, 4) }), figOutlineMaterial(), 1);
+  warmOutline.visible = true;
+  warmOutline.name = 'fig:warm';
+  group.add(warmOutline);
+  warm.push(warmOutline);
 
   /* Far batches */
   let far = null;
@@ -2765,9 +2888,11 @@ function createFigureKit(scene, designOf, opts = {}) {
   let forceLod = -1;
 
   function lodFor(h, r, dist) {
-    const sf = Math.max(0.6, Math.min(1.8, (r.met.totalH * scl[h]) / 0.14));
-    const tn = FIG_LOD.nearDist * sf * quality.dist;
-    const tm = FIG_LOD.midDist * sf * quality.dist;
+    // Size factor relative to a typical figurine at the current FIG_SCALE, so a larger display scale keeps the same
+    // LOD distances (and the Xbox triangle and draw-call budgets) instead of pushing every switch further out.
+    const sf = Math.max(0.6, Math.min(1.8, (r.met.totalH * scl[h]) / (0.14 * FIG_SCALE)));
+    const tn = FIG_LOD.nearDist * sf * quality.dist * quality.zoom;
+    const tm = FIG_LOD.midDist * sf * quality.dist * quality.zoom;
     const hy = FIG_LOD.hysteresis;
     const prev = lod[h];
     if (prev === 0) return dist < tn * (1 + hy) ? 0 : dist < tm ? 1 : 2;
@@ -2808,6 +2933,12 @@ function createFigureKit(scene, designOf, opts = {}) {
       fx[h * 2 + 1] = flash;
       fxDirty[h] = 1;
     },
+    /** Aim highlight: rim glow amount 0..1 (0 = off). A highlighted handle is drawn at most at the mid LOD. */
+    setRim(h, amount) {
+      if (rim[h] === amount) return;
+      rim[h] = amount;
+      fxDirty[h] = 1;
+    },
     setCategoryShimmer(categoryKey, amount) {
       const i = FIG_CATEGORY_INDEX[categoryKey];
       if (i === undefined) return;
@@ -2815,6 +2946,13 @@ function createFigureKit(scene, designOf, opts = {}) {
     },
     setCamera(camera) {
       cam = camera;
+    },
+    /**
+     * LOD distance multiplier for a narrowed view (binocular zoom): 1 = normal, larger keeps the near and mid LODs out
+     * to proportionally larger distances, since the magnified figures cover more pixels.
+     */
+    setLodZoom(k) {
+      quality.zoom = Math.max(1, k);
     },
     /** Development / preview: draw every handle at one LOD (0, 1, 2), or -1 for distance-based LOD. */
     setForceLod(l) {
@@ -2862,6 +3000,9 @@ function createFigureKit(scene, designOf, opts = {}) {
       let nMid = 0;
       let nFar = 0;
       let nCull = 0;
+      let olH = -1;
+      let olL = 0;
+      let olV = 0.02;
       let loose = 0;
       let shelf = 0;
       let tris = 0;
@@ -2908,21 +3049,15 @@ function createFigureKit(scene, designOf, opts = {}) {
           L = lodFor(h, r, Math.sqrt(dx * dx + dy * dy + dz * dz));
         }
         if (forceLod >= 0) L = forceLod;
-        if (r.ext) L = Math.min(L, 1);
+        if (r.ext || rim[h] > 0) L = Math.min(L, 1);
         const wasFar = lod[h] === 2;
         lod[h] = L;
         if (L === 2) {
           if (!wasFar || poseDirty[h] || fxDirty[h]) {
             figM2.fromArray(hm, h * 16);
-            if (!baseOn[h] && r.hasBase) {
-              /* No base wanted (actors): only the ghost batch can skip it, so draw this handle at mid instead */
-              lod[h] = 1;
-              L = 1;
-              far.collapse(h);
-            } else {
-              far.write(h, figM2, glow, flash, shim);
-              if (farGhost) farGhost.write(h, figM2, glow, flash, shim);
-            }
+            // No base wanted (actors, figurines lying in a pile): the base part of the far slot is collapsed.
+            far.write(h, figM2, glow, flash, shim, !baseOn[h] && r.hasBase);
+            if (farGhost) farGhost.write(h, figM2, glow, flash, shim);
           }
           poseDirty[h] = 0;
           fxDirty[h] = 0;
@@ -2945,6 +3080,11 @@ function createFigureKit(scene, designOf, opts = {}) {
           }
         }
         figM2.fromArray(hm, h * 16);
+        if (rim[h] > olV && !r.ext) {
+          olV = rim[h];
+          olH = h;
+          olL = L;
+        }
         if (r.ext) {
           const e = r.ext;
           const k = e.cnt++;
@@ -2953,6 +3093,7 @@ function createFigureKit(scene, designOf, opts = {}) {
           for (const em of e.meshes) {
             figM2.toArray(em.instanceMatrix.array, k * 16);
             const a = em.geometry.attributes.figInst.array;
+            a[k * 4] = rim[h];
             a[k * 4 + 1] = glow;
             a[k * 4 + 2] = flash;
             a[k * 4 + 3] = shim;
@@ -2966,7 +3107,7 @@ function createFigureKit(scene, designOf, opts = {}) {
           figM1.multiplyMatrices(figM2, r.local[L]);
           figM1.toArray(mesh.instanceMatrix.array, k * 16);
           const a = mesh.geometry.attributes.figInst.array;
-          a[k * 4] = 0;
+          a[k * 4] = rim[h];
           a[k * 4 + 1] = glow;
           a[k * 4 + 2] = flash;
           a[k * 4 + 3] = shim;
@@ -2988,6 +3129,7 @@ function createFigureKit(scene, designOf, opts = {}) {
           c[k * 4 + 2] = r.ringLin[2];
           c[k * 4 + 3] = r.catIndex;
           const a = b.inst.array;
+          a[k * 4] = rim[h];
           a[k * 4 + 1] = glow * 0.5;
           a[k * 4 + 2] = flash * 0.5;
           a[k * 4 + 3] = 0;
@@ -3052,6 +3194,31 @@ function createFigureKit(scene, designOf, opts = {}) {
       if (farGhost) farGhost.flush();
       draws += 1 + (farGhost ? 1 : 0);
       tris += far.liveTris + (farGhost ? farGhost.liveTris : 0);
+      // Aim outline around the most highlighted visible handle (figure, then its base).
+      outline[0].visible = false;
+      outline[1].visible = false;
+      if (olH >= 0) {
+        const r = recs[designIdx[olH]];
+        figM2.fromArray(hm, olH * 16);
+        outline[0].geometry = r.meshes[olL].geometry;
+        figM1.multiplyMatrices(figM2, r.local[olL]);
+        outline[0].setMatrixAt(0, figM1);
+        outline[0].instanceMatrix.needsUpdate = true;
+        outline[0].visible = true;
+        draws++;
+        tris += r.tris[olL];
+        if (r.hasBase && baseOn[olH]) {
+          outline[1].geometry = bases[olL].mesh.geometry;
+          baseLocal.makeScale(r.baseScale * FIG_CM, FIG_CM, r.baseScale * FIG_CM);
+          figM1.multiplyMatrices(figM2, baseLocal);
+          outline[1].setMatrixAt(0, figM1);
+          outline[1].instanceMatrix.needsUpdate = true;
+          outline[1].visible = true;
+          draws++;
+          tris += bases[olL].tris;
+        }
+        FIG_MATERIALS.outline.uniforms.uAmount.value = Math.min(1, olV);
+      }
       info.near = nNear;
       info.mid = nMid;
       info.far = nFar;
@@ -3350,6 +3517,8 @@ async function loadExternalFigure(designId) {
 function createSnitchFlyer(scene) {
   const group = new THREE.Group();
   group.name = 'fig:snitch';
+  // Modelled at the original statuette scale; follows the global figurine scale like every other figure.
+  group.scale.setScalar(FIG_SCALE);
   const gold = new THREE.MeshPhysicalMaterial({ color: 0xe0b24a, metalness: 1, roughness: 0.16, clearcoat: 0.6, emissive: 0x3a2606, emissiveIntensity: 0.6 });
   const R = 0.017;
   const ballGeo = new THREE.SphereGeometry(R, 24, 16);
@@ -5247,7 +5416,7 @@ const uPointScale = { value: 500 };
 /** The world description consumed by gameplay (DESIGN.md 16.13). */
 const WORLD = {
   colliders: [], units: {}, slots: [], slotById: {}, tower: null, heaps: [], interactables: [], cardSpots: [], uniqueSpots: {},
-  snitchPerches: [], nifflerWaypoints: [], startPose: START_POSE, finalePath: FINALE_PATH, supports: [],
+  snitchPerches: [], nifflerWaypoints: [], startPose: START_POSE, finalePath: FINALE_PATH, supports: [], unitGaps: [],
 };
 
 /* ------------------------------------------------------------------------------------------------
@@ -5882,6 +6051,12 @@ function addColliderBox(minX, maxX, minZ, maxZ, top = 3, tag = '') {
 
 function addColliderCircle(x, z, r, top = 3, tag = '') {
   const c = { type: 'circle', x, z, r, top, tag };
+  WORLD.colliders.push(c);
+  return c;
+}
+/** Elliptical collider (the figurine heaps): it blocks the player only; figurines rest on the pile instead. */
+function addColliderEllipse(x, z, rx, rz, top = 1, tag = '') {
+  const c = { type: 'ellipse', x, z, rx, rz, top, tag };
   WORLD.colliders.push(c);
   return c;
 }
@@ -6613,21 +6788,24 @@ function buildBlobs(cap) {
    Slots
    ------------------------------------------------------------------------------------------------ */
 
-/** Copy positions of a slot in its local frame (x right, z towards the room): rows of up to 5, staggered. */
-function slotLocalPositions(cap, baseR) {
+/**
+ * Copy positions of a slot in its local frame (x right, z towards the room): rows of 4, 3 and 3 (front row widest),
+ * centred; a row offset by half a pitch from the one in front of it is tucked in (hexagonal packing), an aligned row
+ * keeps a full base diameter. The pitch is the base diameter plus a small gap, squeezed only as far as the slot width
+ * needs; the front row stays on the shelf board.
+ */
+function slotLocalPositions(cap, baseR, slotW) {
   const out = [];
-  const rows = Math.max(1, Math.ceil(cap / 5));
-  const perRow = Math.ceil(cap / rows);
-  const pitchX = Math.min(2 * baseR + 0.012, 0.56 / Math.max(1, perRow));
-  const depth = 0.3;
-  const pitchZ = rows > 1 ? Math.min(2 * baseR + 0.02, depth / (rows - 1 + 1e-6)) : 0;
-  const z0 = rows > 1 ? -0.085 : -0.16;
-  let k = 0;
-  for (let r = 0; r < rows && k < cap; r++) {
-    const inRow = Math.min(perRow, cap - k);
-    const stagger = rows > 1 ? (r % 2 === 0 ? -0.25 : 0.25) * pitchX : 0;
-    for (let i = 0; i < inRow; i++, k++) out.push([(i - (inRow - 1) / 2) * pitchX + stagger, z0 - r * pitchZ]);
-  }
+  const pattern = cap <= 4 ? [cap] : cap <= 7 ? [4, cap - 4] : [4, 3, cap - 7];
+  const widest = Math.max(...pattern);
+  const pitchX = Math.min(2 * baseR + 0.012, widest > 1 ? (slotW - 2 * baseR - 0.01) / (widest - 1) : 1);
+  const touch = 2 * baseR + 0.008;
+  const dzHex = Math.sqrt(Math.max(0, touch * touch - 0.25 * pitchX * pitchX));
+  let z = -(baseR + 0.035);
+  pattern.forEach((n, r) => {
+    if (r > 0) z -= (n % 2) !== (pattern[r - 1] % 2) ? dzHex : touch;
+    for (let i = 0; i < n; i++) out.push([(i - (n - 1) / 2) * pitchX, z]);
+  });
   return out;
 }
 
@@ -6707,49 +6885,132 @@ function unitPoint(L, lx, ly, lz) {
   return vec3(L.x + tv5.x, ly, L.z + tv5.z);
 }
 
-/** Top surface of a unit's cornice (the Griffendél card rests there). */
-const UNIT_TOP_Y = UNIT.top + 0.099;
+/**
+ * Sizes every shelving unit from its own figurines and spreads the units over their walls (called once, before
+ * buildUnits). A slot holds the ten copies of one design in three staggered rows (4 + 3 + 3) of the category's widest
+ * base; a level fits the category's tallest design; the number of levels follows from the design count and the unit's
+ * columns. Fills UNIT_LAYOUT[key].x / z / dims, UNIT.depth (common to all units) and WORLD.unitGaps (the gaps between
+ * neighbouring units, filled by narrow decor racks).
+ */
+function layoutShelves() {
+  const U = UNIT;
+  const round2 = (v) => Math.round(v * 100) / 100;
+  const ceil2 = (v) => Math.ceil(v * 100 - 1e-6) / 100;
+  let depth = 0;
+  for (const key in UNIT_LAYOUT) {
+    const L = UNIT_LAYOUT[key];
+    const designs = FIG_DESIGNS.filter((d) => d.category === key);
+    let maxH = 0;
+    let maxR = 0;
+    for (const d of designs) {
+      const m = getFigureMetrics(d.id);
+      maxH = Math.max(maxH, m.totalH);
+      maxR = Math.max(maxR, m.baseR);
+    }
+    const cols = Math.max(1, L.cols || 2);
+    const levelCount = Math.max(1, Math.ceil(designs.length / cols));
+    // Three pitches of (diameter + 12 mm) plus one base diameter and a margin (the 4-wide front row).
+    const slotW = ceil2(8 * maxR + 0.056);
+    const clear = ceil2(maxH + 0.03);
+    const levels = [];
+    for (let i = 0; i < levelCount; i++) levels.push(round2(U.firstLevel + i * (clear + U.board)));
+    const top = round2(levels[levelCount - 1] + clear);
+    const width = round2(cols * slotW + (cols - 1) * U.divider + 2 * U.side);
+    const slotX = [];
+    for (let c = 0; c < cols; c++) slotX.push((c - (cols - 1) / 2) * (slotW + U.divider));
+    // Slot order: top level first, left before right.
+    const order = [];
+    for (let li = levelCount - 1; li >= 0; li--) for (let c = 0; c < cols; c++) order.push([li, c]);
+    const back = Math.max(...slotLocalPositions(10, maxR, slotW).map(([, pz]) => -pz)) + maxR;
+    depth = Math.max(depth, back + 0.04);
+    const signW = Math.min(U.signW, width - 0.06);
+    L.dims = {
+      cols, levels, clear, top, width, slotW, slotX, order, maxR,
+      cornice: top + 0.099, signY: round2(Math.min(2.9, top + 0.46)), signW, signH: Math.min(U.signH, signW * 0.3),
+    };
+  }
+  U.depth = round2(depth);
+  WORLD.unitGaps = [];
+  for (const wall of ['back', 'left', 'right']) {
+    const list = Object.values(UNIT_LAYOUT).filter((L) => L.wall === wall).sort((a, b) => a.order - b.order);
+    if (!list.length) continue;
+    const span = UNIT_WALLS[wall];
+    const total = list.reduce((s, L) => s + L.dims.width, 0);
+    const free = span.to - span.from - total;
+    if (free < 0) console.warn('[world] shelving units are wider than the wall', wall, free.toFixed(2));
+    const edge = Math.max(0, Math.min(0.06, free / (2 * list.length)));
+    const gap = list.length > 1 ? (free - 2 * edge) / (list.length - 1) : 0;
+    const front = U.depth + 0.02;
+    let at = span.from + edge;
+    list.forEach((L, i) => {
+      const c = at + L.dims.width / 2;
+      if (wall === 'back') {
+        L.x = round2(c);
+        L.z = HALL.minZ + front;
+      } else {
+        L.z = round2(c);
+        L.x = wall === 'left' ? HALL.minX + front : HALL.maxX - front;
+      }
+      if (i > 0) WORLD.unitGaps.push({ wall, at: round2(at - gap / 2), w: gap });
+      at += L.dims.width + gap;
+    });
+  }
+  // Spots that rest on a unit move with it: card 1 on the Griffendél cornice, the 4th Snitch perch on the Kviddics unit.
+  const G = UNIT_LAYOUT.gryffindor;
+  CARD_SPOTS[0][0] = G.x - G.dims.width * 0.3;
+  CARD_SPOTS[0][1] = G.dims.cornice + 0.006;
+  CARD_SPOTS[0][2] = HALL.minZ + 0.25;
+  const Q = UNIT_LAYOUT.quidditch;
+  SNITCH_PERCHES[3][0] = HALL.maxX - 0.38;
+  SNITCH_PERCHES[3][1] = Q.dims.cornice + 0.001;
+  SNITCH_PERCHES[3][2] = Q.z;
+}
 
 function buildUnits() {
+  layoutShelves();
   FIG_CATEGORIES.forEach((cat, ci) => {
     const L = UNIT_LAYOUT[cat.key];
     if (!L) return;
     const F = new DecoFrame(L.x, L.z, L.yaw);
     const U = UNIT;
-    const hw = U.width / 2;
+    const Dm = L.dims;
+    const W = Dm.width;
+    const top = Dm.top;
+    const hw = W / 2;
     const D = U.depth;
     const carcass = PAL.plumMid;
     const trim = [PAL.orange, PAL.lime, PAL.magenta, PAL.turquoise][ci % 4];
-    for (const sx of [-1, 1]) DB.paint.box(carcass, F.at(sx * (hw - U.side / 2 - 0.0), U.top / 2, -D / 2), U.side, U.top, D);
-    DB.paint.box(carcass, F.at(0, U.top + 0.025, -D / 2 + 0.01), U.width + 0.06, 0.05, D + 0.04, 'x');
-    DB.paint.box(trim, F.at(0, U.top + 0.07, -D / 2 + 0.02), U.width + 0.12, 0.045, D + 0.08, 'x');
-    DB.metal.box(PAL.gold, F.at(0, U.top + 0.095, -D / 2 + 0.02), U.width + 0.1, 0.008, D + 0.06, 'x');
-    DB.paint.box(PAL.ink, F.at(0, U.plinth / 2, -D / 2), U.width - 0.02, U.plinth, D - 0.02, 'x');
+    for (const sx of [-1, 1]) DB.paint.box(carcass, F.at(sx * (hw - U.side / 2 - 0.0), top / 2, -D / 2), U.side, top, D);
+    DB.paint.box(carcass, F.at(0, top + 0.025, -D / 2 + 0.01), W + 0.06, 0.05, D + 0.04, 'x');
+    DB.paint.box(trim, F.at(0, top + 0.07, -D / 2 + 0.02), W + 0.12, 0.045, D + 0.08, 'x');
+    DB.metal.box(PAL.gold, F.at(0, top + 0.095, -D / 2 + 0.02), W + 0.1, 0.008, D + 0.06, 'x');
+    DB.paint.box(PAL.ink, F.at(0, U.plinth / 2, -D / 2), W - 0.02, U.plinth, D - 0.02, 'x');
     const back = new THREE.Color(cat.color).lerp(new THREE.Color(PAL.cream), cat.key === 'hallows_horcruxes' ? 0.15 : 0.35);
-    DB.paint.box(back, F.at(0, (U.top + U.plinth) / 2, -D + 0.01), U.width - 2 * U.side, U.top - U.plinth, 0.02);
-    for (const sx of [-1, 1]) DB.paint.box(trim, F.at(sx * (hw - 0.04), (U.top + U.plinth) / 2, 0.003), 0.08, U.top - U.plinth, 0.012);
-    U.levels.forEach((ys, li) => {
-      DB.paint.box(PAL.plum, F.at(0, ys - U.board / 2, -D / 2 - 0.01), U.width - 2 * U.side, U.board, D - 0.04, 'x');
-      DB.paint.box(trim, F.at(0, ys - U.board / 2 - 0.002, -0.024), U.width - 2 * U.side, U.board + 0.005, 0.012, 'x');
-      const nextY = li + 1 < U.levels.length ? U.levels[li + 1] - U.board : U.top;
-      DB.metal.box(PAL.gold, F.at(0, (ys + nextY) / 2, -D / 2), 0.012, nextY - ys, 0.012);
-      aoBatch.strip(unitPoint(L, -hw + U.side, nextY, -0.004), yawRotate(1, 0, L.yaw, new THREE.Vector3()), U.width - 2 * U.side, vec3(0, -1, 0), 0.09);
+    DB.paint.box(back, F.at(0, (top + U.plinth) / 2, -D + 0.01), W - 2 * U.side, top - U.plinth, 0.02);
+    for (const sx of [-1, 1]) DB.paint.box(trim, F.at(sx * (hw - 0.04), (top + U.plinth) / 2, 0.003), 0.08, top - U.plinth, 0.012);
+    Dm.levels.forEach((ys, li) => {
+      DB.paint.box(PAL.plum, F.at(0, ys - U.board / 2, -D / 2 - 0.01), W - 2 * U.side, U.board, D - 0.04, 'x');
+      DB.paint.box(trim, F.at(0, ys - U.board / 2 - 0.002, -0.024), W - 2 * U.side, U.board + 0.005, 0.012, 'x');
+      const nextY = li + 1 < Dm.levels.length ? Dm.levels[li + 1] - U.board : top;
+      for (let c = 1; c < Dm.cols; c++) {
+        const dx = (Dm.slotX[c - 1] + Dm.slotX[c]) / 2;
+        DB.metal.box(PAL.gold, F.at(dx, (ys + nextY) / 2, -D / 2), 0.012, nextY - ys, 0.012);
+      }
+      aoBatch.strip(unitPoint(L, -hw + U.side, nextY, -0.004), yawRotate(1, 0, L.yaw, new THREE.Vector3()), W - 2 * U.side, vec3(0, -1, 0), 0.09);
     });
-    // Drawer front below the first shelf, with two gilt knobs.
-    const drawerTop = U.levels[0] - U.board - 0.012;
-    DB.paint.box(trim, F.at(0, (drawerTop + U.plinth) / 2, -0.01), U.width - 2 * U.side - 0.02, drawerTop - U.plinth, 0.02, 'x');
-    for (const sx of [-0.33, 0.33]) DB.metal.sphere(PAL.gold, F.at(sx, (drawerTop + U.plinth) / 2, 0.012), 0.02, 10, 8);
     // Sign above the unit (leaning forward): painted frame, atlas face, gilt rods to the wall.
-    const sm = F.at(0, U.signY, -0.12, 0.105, 0, 0);
-    DB.paint.geo(boxGeo(U.signW + 0.08, U.signH, 0.04, { grain: 'x' }), PAL.plumDeep, sm);
-    const signBase = addSignQuad(sm.clone().multiply(dmat(0, 0, 0.0215)), U.signW, U.signW / 4, ci);
-    for (const sx of [-0.6, 0.6]) DB.metal.cyl(PAL.gold, F.at(sx, U.signY + 0.16, -0.27, Math.PI / 2, 0, 0), 0.012, 0.012, 0.2, 6);
+    const sm = F.at(0, Dm.signY, -0.12, 0.105, 0, 0);
+    DB.paint.geo(boxGeo(Dm.signW + 0.08, Dm.signH, 0.04, { grain: 'x' }), PAL.plumDeep, sm);
+    const signBase = addSignQuad(sm.clone().multiply(dmat(0, 0, 0.0215)), Dm.signW, Dm.signW / 4, ci);
+    const rodX = Dm.signW * 0.375;
+    for (const sx of [-rodX, rodX]) DB.metal.cyl(PAL.gold, F.at(sx, Dm.signY + Dm.signH / 3, -0.12 - (D - 0.12) / 2, Math.PI / 2, 0, 0), 0.012, 0.012, D - 0.12, 6);
     // Sconces: gilt arm and cup with a candle, unlit until the category is complete.
     const sconces = [];
-    for (const sx of [-0.62, 0.62]) {
-      DB.metal.cyl(PAL.gold, F.at(sx, 1.93, -0.01, Math.PI / 2, 0, 0), 0.009, 0.009, 0.12, 6);
-      DB.metal.lathe(PAL.gold, F.at(sx, 1.93, 0.05), [[0, 0], [0.03, 0], [0.034, 0.01], [0.02, 0.025], [0, 0.025]], 14);
-      const wp = unitPoint(L, sx, 1.955, 0.05);
+    const sconceY = top + 0.19;
+    for (const sx of [-(hw - 0.11), hw - 0.11]) {
+      DB.metal.cyl(PAL.gold, F.at(sx, sconceY, -0.01, Math.PI / 2, 0, 0), 0.009, 0.009, 0.12, 6);
+      DB.metal.lathe(PAL.gold, F.at(sx, sconceY, 0.05), [[0, 0], [0.03, 0], [0.034, 0.01], [0.02, 0.025], [0, 0.025]], 14);
+      const wp = unitPoint(L, sx, sconceY + 0.025, 0.05);
       sconces.push(addCandle(wp.x, wp.y, wp.z, 0.1, 0.011, { lit: false, glow: 0.4 }));
     }
     // Collider and floor shadow.
@@ -6758,49 +7019,50 @@ function buildUnits() {
     const maxX = Math.max(...corners.map((c) => c.x)) + 0.08;
     const minZ = Math.min(...corners.map((c) => c.z)) - 0.08;
     const maxZ = Math.max(...corners.map((c) => c.z)) + 0.08;
-    addColliderBox(minX, maxX, minZ, maxZ, 2.5, `unit:${cat.key}`);
-    addSupport(Math.min(corners[0].x, corners[3].x) + 0.02, Math.max(corners[0].x, corners[3].x) - 0.02, Math.min(corners[0].z, corners[3].z) + 0.02, Math.max(corners[0].z, corners[3].z) - 0.02, UNIT_TOP_Y);
+    addColliderBox(minX, maxX, minZ, maxZ, top + 0.2, `unit:${cat.key}`);
+    addSupport(Math.min(corners[0].x, corners[3].x) + 0.02, Math.max(corners[0].x, corners[3].x) - 0.02, Math.min(corners[0].z, corners[3].z) + 0.02, Math.max(corners[0].z, corners[3].z) - 0.02, Dm.cornice);
     const sc = unitPoint(L, 0, 0, -D / 2 + 0.06);
-    shadowBatch.floor(sc.x, sc.z, U.width + 0.35, D + 0.45, L.yaw, 0.012);
+    shadowBatch.floor(sc.x, sc.z, W + 0.35, D + 0.45, L.yaw, 0.012);
     const unit = {
       cat: cat.key, catIdx: ci, origin: vec3(L.x, 0, L.z), yaw: L.yaw, aabb: { minX, maxX, minZ, maxZ }, slotIds: [], sconces, signQuad: SIGNS.quads.length,
-      front: unitPoint(L, 0, 0, 0.7), done: false,
+      front: unitPoint(L, 0, 0, 0.7), done: false, dims: Dm,
     };
     SIGNS.quads.push(signBase);
     WORLD.units[cat.key] = unit;
     // Slots: the category's designs in catalog order fill the top level first.
     const designs = FIG_DESIGNS.filter((d) => d.category === cat.key);
-    designs.slice(0, UNIT_SLOT_ORDER.length).forEach((d, si) => {
-      const [li, side] = UNIT_SLOT_ORDER[si];
+    designs.slice(0, Dm.order.length).forEach((d, si) => {
+      const [li, side] = Dm.order[si];
       const met = getFigureMetrics(d.id);
       const s = newSlot(d.id, 'unit', d.id, cat.key, d.copies);
       s.unit = cat.key;
       s.nameHu = d.nameHu;
       s.yaw = L.yaw;
-      const lx = UNIT.slotX[side];
-      const ly = UNIT.levels[li];
-      s.center.copy(unitPoint(L, lx, ly + UNIT.clear / 2, -D / 2));
-      s.halfSize.set(UNIT.slotW / 2, UNIT.clear / 2, D / 2);
-      const baseR = Math.max(0.03, met.baseR || 0.036);
+      const lx = Dm.slotX[side];
+      const ly = Dm.levels[li];
+      s.center.copy(unitPoint(L, lx, ly + Dm.clear / 2, -D / 2));
+      s.halfSize.set(Dm.slotW / 2, Dm.clear / 2, D / 2);
+      const baseR = Math.max(0.03 * FIG_SCALE, met.baseR || 0.036 * FIG_SCALE);
       s.markerR = baseR * 0.9;
       const jr = rng(1000 + ci * 50 + si);
-      for (const [px, pz] of slotLocalPositions(d.copies, baseR)) {
+      for (const [px, pz] of slotLocalPositions(d.copies, baseR, Dm.slotW)) {
         s.positions.push(unitPoint(L, lx + px, ly, pz));
         s.yaws.push(L.yaw + (jr() - 0.5) * 0.12);
         s.posScale.push(1);
       }
-      // Larger name plates (about 1.36x) so names and the state colour read from a couch at TV distance.
-      const pp = unitPoint(L, lx, ly - 0.034, 0.014);
-      addPlate(s, pp.x, pp.y, pp.z, L.yaw, 12 * DEG, 0.3, 0.075);
+      // Name plates sized to the slot so names and the state colour read at TV distance.
+      const pp = unitPoint(L, lx, ly - 0.04, 0.014);
+      addPlate(s, pp.x, pp.y, pp.z, L.yaw, 12 * DEG, Math.min(0.42, Dm.slotW * 0.5), 0.09);
       unit.slotIds.push(s.id);
     });
-    if (designs.length > UNIT_SLOT_ORDER.length) console.warn('[world] too many designs for unit', cat.key, designs.length);
-    // Free slot positions get a small prop (a box of products), so the shelf never looks unfinished.
-    for (let si = designs.length; si < UNIT_SLOT_ORDER.length; si++) {
-      const [li, side] = UNIT_SLOT_ORDER[si];
-      const lx = UNIT.slotX[side];
+    if (designs.length > Dm.order.length) console.warn('[world] too many designs for unit', cat.key, designs.length);
+    // Free slot positions get a few product boxes, so the shelf never looks unfinished.
+    for (let si = designs.length; si < Dm.order.length; si++) {
+      const [li, side] = Dm.order[si];
+      const lx = Dm.slotX[side];
       const r = rng(ci * 31 + si);
-      for (let k = 0; k < 3; k++) addProductBox(F, lx - 0.18 + k * 0.17, UNIT.levels[li], -0.16, 0.14, 0.1 + r() * 0.12, 0.16, Math.floor(r() * 16), (r() - 0.5) * 0.3);
+      const step = Dm.slotW * 0.3;
+      for (let k = 0; k < 3; k++) addProductBox(F, lx + (k - 1) * step, Dm.levels[li], -D * 0.4, 0.22, Math.min(Dm.clear - 0.04, 0.16 + r() * 0.16), 0.24, Math.floor(r() * 16), (r() - 0.5) * 0.3);
     }
   });
 }
@@ -6933,10 +7195,12 @@ function buildTower() {
         s.yaws.push(a + da);
         s.posScale.push(sz.scale);
       }
+      // Aim box: the ring segment up to a little above the statuettes of this size.
+      const hh = getFigureMetrics(designId).totalH * sz.scale;
       yawRotate(0, 0.7, a, tv5);
-      s.center.set(T.x + tv5.x, y + 0.13, T.z + tv5.z);
-      s.halfSize.set(0.36, 0.15, 0.25);
-      s.markerR = 0.05 * sz.scale;
+      s.center.set(T.x + tv5.x, y + hh / 2 + 0.02, T.z + tv5.z);
+      s.halfSize.set(0.36, Math.max(0.15, hh / 2 + 0.05), 0.25);
+      s.markerR = 0.05 * FIG_SCALE * sz.scale;
       s.nameHu = `${FIG_CATEGORIES[FIG_CATEGORY_INDEX[sec.house]].nameHu} · ${sz.nameHu}`;
       yawRotate(0, T.outerR + 0.012, a, tv5);
       addPlate(s, T.x + tv5.x, y - 0.022, T.z + tv5.z, a, 8 * DEG, 0.2, 0.036);
@@ -6950,8 +7214,9 @@ function buildTower() {
     s.positions.push(vec3(T.x, T.topY, T.z));
     s.yaws.push(0);
     s.posScale.push(1);
-    s.center.set(T.x, T.topY + 0.17, T.z);
-    s.halfSize.set(0.22, 0.2, 0.22);
+    const ch = getFigureMetrics('house_cup').totalH;
+    s.center.set(T.x, T.topY + ch / 2, T.z);
+    s.halfSize.set(0.22, Math.max(0.2, ch / 2 + 0.05), 0.22);
     s.markerR = 0.1;
     s.nameHu = cup.nameHu;
     addPlate(s, T.x, T.topY - 0.03, T.z + 0.205, 0, 4 * DEG, 0.16, 0.034);
@@ -7234,10 +7499,11 @@ function buildCounter() {
   hs.positions.push(vec3(H.x, H.y + 0.05, H.z));
   hs.yaws.push(Math.PI * 0.5 + 0.3);
   hs.posScale.push(1);
-  hs.center.set(H.x, H.y + 0.15, H.z);
-  hs.halfSize.set(0.12, 0.13, 0.12);
+  const honorH = getFigureMetrics('shopkeeper').totalH;
+  hs.center.set(H.x, H.y + 0.05 + honorH / 2, H.z);
+  hs.halfSize.set(0.13, Math.max(0.13, honorH / 2 + 0.04), 0.13);
   hs.yaw = 0;
-  hs.markerR = 0.04;
+  hs.markerR = 0.04 * FIG_SCALE;
   hs.nameHu = TXT.setNameDefault;
   addPlate(hs, H.x + 0.085, H.y + 0.025, H.z, Math.PI / 2, 6 * DEG, 0.12, 0.03);
   WORLD.interactables.push({ id: 'honor', pos: vec3(H.x, H.y + 0.1, H.z), r: INTERACT_R, nameKey: 'useHonor' });
@@ -7435,13 +7701,16 @@ function buildWorld(quality) {
   flushGeometry(G.porcelain, M.porcelain, false, true);
   buildShafts();
   buildDust(quality === 'xbox' ? 200 : 260);
-  for (const h of HEAP_DEFS) {
-    WORLD.heaps.push({ id: h.id, x: h.x, z: h.z, r: h.r, h0: 0.1, quota: 0, crate: false, share: h.share });
-    roundBatch.floor(h.x, h.z, h.r * 2.6, h.r * 2.6, 0, 0.0115);
-    DQ.straw.floor(h.x, h.z, h.r * 2.9, h.r * 2.9, h.x * 1.7, 0.008);
-  }
+  HEAP_DEFS.forEach((h, i) => {
+    WORLD.heaps.push({ id: h.id, x: h.x, z: h.z, rx: h.rx, rz: h.rz, r: Math.max(h.rx, h.rz), h0: h.core, quota: 0, crate: false, share: h.share, pile: [] });
+    // The pile is solid for the player (the figurines are piled up to about chest height).
+    addColliderEllipse(h.x, h.z, h.rx * HEAP_SOLID, h.rz * HEAP_SOLID, h.core + 0.4, `heap:${h.id}`);
+    roundBatch.floor(h.x, h.z, h.rx * 2.5, h.rz * 2.5, 0, 0.0115);
+    // Elliptical straw spill: only half turns keep it aligned with the heap's axes.
+    DQ.straw.floor(h.x, h.z, h.rx * 2.3, h.rz * 2.3, i * Math.PI, 0.008);
+  });
   for (const c of CRATE_DEFS) {
-    WORLD.heaps.push({ id: c.id, x: (c.minX + c.maxX) / 2, z: (c.minZ + c.maxZ) / 2, r: 0.38, h0: 0, quota: 0, crate: true, share: c.share, box: c });
+    WORLD.heaps.push({ id: c.id, x: (c.minX + c.maxX) / 2, z: (c.minZ + c.maxZ) / 2, r: 0.38, rx: 0.38, rz: 0.38, h0: 0, quota: 0, crate: true, share: c.share, box: c });
   }
   finishDecor();
   aoBatch.mesh(M.ao, 1);
@@ -7643,6 +7912,11 @@ function stockRack(F, x0, x1, y0, y1, depth, step, r, opts = {}) {
    Gallery with balustrade, valance, columns and the spiral stair
    ------------------------------------------------------------------------------------------------ */
 
+/** Centres of the gaps between neighbouring shelving units on a wall (x on the back wall, z on the side walls). */
+function unitGapsAt(wall) {
+  return WORLD.unitGaps.filter((g) => g.wall === wall).map((g) => g.at);
+}
+
 function buildGallery() {
   const y = GALLERY.y;
   const d = GALLERY.depth;
@@ -7715,15 +7989,15 @@ function buildGallery() {
       DB.metal.sphere(PAL.gold, dmat(p.x, y + 1.08, p.z), 0.08, 12, 8);
     }
   }
-  // Curly gilt brackets under the cantilevered deck, and bobbin-turned columns at the open corners.
+  // Curly gilt brackets under the cantilevered deck (above the gaps between the shelving units), and bobbin-turned
+  // columns at the open corners.
   const by = y - GALLERY.t - 0.3;
-  for (const x of [-7.2, -5.4, -3.6, -1.8, 0.0, 3.0]) DB.metal.torus(PAL.gold, dmat(x, by, HALL.minZ + 0.72, 0, Math.PI / 2, 0), 0.3, 0.028, 6, 14, Math.PI / 2);
-  for (const z of [-4.6, -2.4, -0.4, 1.75]) {
-    DB.metal.torus(PAL.gold, dmat(HALL.minX + 0.72, by, z, 0, Math.PI, 0), 0.3, 0.028, 6, 14, Math.PI / 2);
-    DB.metal.torus(PAL.gold, dmat(HALL.maxX - 0.72, by, z), 0.3, 0.028, 6, 14, Math.PI / 2);
-  }
+  for (const x of [-7.2, ...unitGapsAt('back'), 0.0, 3.0]) DB.metal.torus(PAL.gold, dmat(x, by, HALL.minZ + 0.72, 0, Math.PI / 2, 0), 0.3, 0.028, 6, 14, Math.PI / 2);
+  for (const z of [-4.6, ...unitGapsAt('left'), 1.75]) DB.metal.torus(PAL.gold, dmat(HALL.minX + 0.72, by, z, 0, Math.PI, 0), 0.3, 0.028, 6, 14, Math.PI / 2);
+  for (const z of [-4.6, ...unitGapsAt('right'), 1.75]) DB.metal.torus(PAL.gold, dmat(HALL.maxX - 0.72, by, z), 0.3, 0.028, 6, 14, Math.PI / 2);
   const colH = y - GALLERY.t;
-  const cols = [[4.15, fz], [-7.3, fz], [lx, GALLERY.sideEnd], [rx, GALLERY.sideEnd]];
+  // The back-left corner is taken by the shelving units, so only three columns stand on the floor.
+  const cols = [[4.15, fz], [lx, GALLERY.sideEnd], [rx, GALLERY.sideEnd]];
   cols.forEach(([x, z], i) => {
     bobbinColumn(x, z, colH, i & 1 ? [PAL.lime, PAL.purple] : [PAL.purple, PAL.orange]);
     addColliderCircle(x, z, 0.16, colH, 'column');
@@ -7784,19 +8058,22 @@ function buildRacks() {
   const fr = new DecoFrame(0, HALL.maxZ - 0.42, Math.PI);
   stockRack(fr, -7.98, -1.95, 4.25, top, 0.4, 0.44, r);
   stockRack(fr, 0.35, 7.98, 4.25, top, 0.4, 0.44, r);
-  // Ground level: narrow towers in the gaps between the units, and shelves above the units.
-  for (const gx of [-5.4, -3.6, -1.8]) stockRack(back, gx - 0.19, gx + 0.19, 0.12, 3.05, 0.36, 0.38, r, { jars: 0.1 });
+  // Ground level: narrow towers in the gaps between the units (as wide as the gap allows), and shelves above the units.
+  for (const g of WORLD.unitGaps) {
+    const hw = Math.min(0.19, g.w / 2 - 0.02);
+    if (hw < 0.07) continue;
+    // Flush with the unit fronts (their frame sits at the units' depth from the wall).
+    const gd = UNIT.depth - 0.02;
+    const f = UNIT.depth + 0.02;
+    if (g.wall === 'back') stockRack(new DecoFrame(0, HALL.minZ + f, 0), g.at - hw, g.at + hw, 0.12, 3.05, gd, 0.38, r, { jars: 0.1 });
+    else if (g.wall === 'left') stockRack(new DecoFrame(HALL.minX + f, 0, Math.PI / 2), -g.at - hw, -g.at + hw, 0.12, 3.05, gd, 0.38, r, { jars: 0.1 });
+    else stockRack(new DecoFrame(HALL.maxX - f, 0, -Math.PI / 2), g.at - hw, g.at + hw, 0.12, 3.05, gd, 0.38, r, { jars: 0.1 });
+  }
   stockRack(back, -0.17, 0.9, 0.12, 3.05, 0.36, 0.38, r);
   stockRack(back, -7.98, -0.2, 2.62, 3.12, 0.26, 0.5, r, { back: false, stack: 2 });
-  for (const gz of [-2.4, -0.4]) {
-    stockRack(left, -gz - 0.19, -gz + 0.19, 0.12, 3.05, 0.36, 0.38, r, { jars: 0.1 });
-    stockRack(right, gz - 0.19, gz + 0.19, 0.12, 3.05, 0.36, 0.38, r, { jars: 0.1 });
-  }
-  stockRack(left, 4.15, 5.56, 0.12, 3.05, 0.36, 0.38, r);
-  stockRack(left, -1.35, 4.15, 2.62, 3.12, 0.26, 0.5, r, { back: false, stack: 2 });
-  stockRack(right, -4.15, 1.35, 2.62, 3.12, 0.26, 0.5, r, { back: false, stack: 2 });
-  stockRack(left, -2.15, -1.36, 0.12, 3.05, 0.36, 0.38, r);
-  stockRack(right, 1.36, 2.15, 0.12, 3.05, 0.36, 0.38, r);
+  // Shelves above the side-wall units (the units fill the walls from the back corner to the gallery's end).
+  stockRack(left, -2.15, 5.56, 2.62, 3.12, 0.26, 0.5, r, { back: false, stack: 2 });
+  stockRack(right, -4.15, 2.15, 2.62, 3.12, 0.26, 0.5, r, { back: false, stack: 2 });
   // Behind the counter: the left wall front corner and the front wall up to the left window.
   stockRack(left, -5.98, -5.2, 0.12, 3.5, 0.4, 0.42, r);
   stockRack(fr, 4.45, 7.98, 0.12, 3.5, 0.4, 0.42, r);
@@ -8156,10 +8433,12 @@ function buildBanners() {
   // Pennants hanging from the gallery fascia between the units.
   const fz = HALL.minZ + GALLERY.depth + 0.07;
   let k = 0;
-  for (const px of [-5.4, -3.6, -1.8, 3.0]) decoBannerPlane(DECO_BANNER.pennant(k++ % 8), dmat(px, GALLERY.y - 0.6, fz), 0.36, 0.72, 0.5, 1, 4);
-  for (const pz of [-2.4, -0.4, 1.7]) {
-    decoBannerPlane(DECO_BANNER.pennant(k++ % 8), dmat(HALL.minX + GALLERY.depth + 0.07, GALLERY.y - 0.6, pz, 0, Math.PI / 2, 0), 0.36, 0.72, 0.5, 1, 4);
-    decoBannerPlane(DECO_BANNER.pennant(k++ % 8), dmat(HALL.maxX - GALLERY.depth - 0.07, GALLERY.y - 0.6, pz, 0, -Math.PI / 2, 0), 0.36, 0.72, 0.5, 1, 4);
+  for (const px of [...unitGapsAt('back'), 3.0]) decoBannerPlane(DECO_BANNER.pennant(k++ % 8), dmat(px, GALLERY.y - 0.6, fz), 0.36, 0.72, 0.5, 1, 4);
+  const leftZ = [...unitGapsAt('left'), 1.7];
+  const rightZ = [...unitGapsAt('right'), 1.7];
+  for (let i = 0; i < Math.max(leftZ.length, rightZ.length); i++) {
+    if (i < leftZ.length) decoBannerPlane(DECO_BANNER.pennant(k++ % 8), dmat(HALL.minX + GALLERY.depth + 0.07, GALLERY.y - 0.6, leftZ[i], 0, Math.PI / 2, 0), 0.36, 0.72, 0.5, 1, 4);
+    if (i < rightZ.length) decoBannerPlane(DECO_BANNER.pennant(k++ % 8), dmat(HALL.maxX - GALLERY.depth - 0.07, GALLERY.y - 0.6, rightZ[i], 0, -Math.PI / 2, 0), 0.36, 0.72, 0.5, 1, 4);
   }
   // Above the street door: two long pennants either side of the twins' plate.
   const dcx = (SHOP_DOOR.minX + SHOP_DOOR.maxX) / 2;
@@ -8512,10 +8791,11 @@ function buildRugs() {
 
 /** One instanced straw dome per heap; its height follows the heap's height field (set after spawning). */
 function buildHeapMounds() {
+  // Same bell profile as heapHeightAt(), so figurines rest on the visible straw.
   const prof = [];
-  for (let i = 0; i <= 10; i++) {
-    const rad = 1 - i / 10;
-    prof.push([rad, 1 - rad * rad]);
+  for (let i = 0; i <= 14; i++) {
+    const rad = 1 - i / 14;
+    prof.push([rad, heapBell(rad)]);
   }
   const geo = scaleUV(latheGeo(prof, 28, 0, 0, 0, 1), 4, 3);
   const mesh = new THREE.InstancedMesh(geo, M.straw, HEAP_DEFS.length);
@@ -8534,7 +8814,8 @@ function updateHeapMounds() {
   let i = 0;
   for (const hp of WORLD.heaps) {
     if (hp.crate || i >= mesh.count) continue;
-    tm1.compose(tv1.set(hp.x, 0, hp.z), tq1.setFromAxisAngle(UP_AXIS, hp.x * 1.3), tv2.set(hp.r * 1.02, Math.max(0.04, hp.h0 * HEAP_MOUND_K), hp.r * 1.02));
+    // Elliptical dome (rx, rz); only half turns, so the texture varies without twisting the ellipse.
+    tm1.compose(tv1.set(hp.x, 0, hp.z), tq1.setFromAxisAngle(UP_AXIS, i * Math.PI), tv2.set(hp.rx * 1.02, Math.max(0.04, hp.h0), hp.rz * 1.02));
     mesh.setMatrixAt(i++, tm1);
   }
   mesh.instanceMatrix.needsUpdate = true;
@@ -8837,8 +9118,15 @@ const EXT_FACADE = {
   setFx(h, glow, flash) {
     const e = extEntryOf(h);
     const k = e.slotOf.get(h);
-    e.fx[k * 2] = glow;
-    e.fx[k * 2 + 1] = flash;
+    e.fx[k * 3] = glow;
+    e.fx[k * 3 + 1] = flash;
+    e.dirty = true;
+  },
+  setRim(h, amount) {
+    const e = extEntryOf(h);
+    const k = e.slotOf.get(h);
+    if (e.fx[k * 3 + 2] === amount) return;
+    e.fx[k * 3 + 2] = amount;
     e.dirty = true;
   },
   setBaseVisible(h, v) {
@@ -8860,17 +9148,26 @@ const EXT_FACADE = {
   },
 };
 
+/** Aim highlight on external models: the same warm fresnel rim as the procedural figures (vExtFx.z, 0..1). */
+const EXT_RIM_GLSL = [
+  'if (vExtFx.z > 0.001) {',
+  '  float extRimF = 1.0 - clamp(abs(dot(normalize(normal), normalize(vViewPosition))), 0.0, 1.0);',
+  '  float extRim2 = extRimF * extRimF;',
+  '  totalEmissiveRadiance += vExtFx.z * vec3(1.0, 0.74, 0.28) * (0.16 + 1.1 * extRim2 + 3.2 * extRim2 * extRim2);',
+  '}',
+].join('\n');
+
 function extPatchMaterial(mat, shimmer) {
   mat.envMapIntensity = 1.0;
   for (const slot of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap']) if (mat[slot]) mat[slot].anisotropy = Math.min(8, maxAniso);
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uExtShimmer = shimmer;
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute vec2 extFx;\nvarying vec2 vExtFx;')
+      .replace('#include <common>', '#include <common>\nattribute vec3 extFx;\nvarying vec3 vExtFx;')
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvExtFx = extFx;');
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nvarying vec2 vExtFx;\nuniform float uExtShimmer;')
-      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vExtFx.x * vec3(1.0, 0.82, 0.45) * 0.55 + vExtFx.y * vec3(1.2) + uExtShimmer * vec3(1.0, 0.78, 0.35) * 0.35;');
+      .replace('#include <common>', '#include <common>\nvarying vec3 vExtFx;\nuniform float uExtShimmer;')
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\ntotalEmissiveRadiance += vExtFx.x * vec3(1.0, 0.82, 0.45) * 0.55 + vExtFx.y * vec3(1.2) + uExtShimmer * vec3(1.0, 0.78, 0.35) * 0.35;\n${EXT_RIM_GLSL}`);
   };
   mat.customProgramCacheKey = () => `ext-${mat.uuid}`;
   mat.needsUpdate = true;
@@ -8956,7 +9253,7 @@ function extCreateEntry(designId, parts) {
   const meshes = parts.map(({ geometry, material }) => {
     extPatchMaterial(material, shimmer);
     const g = geometry.clone();
-    const fx = new THREE.InstancedBufferAttribute(new Float32Array(cap * 2), 2);
+    const fx = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
     fx.setUsage(THREE.DynamicDrawUsage);
     g.setAttribute('extFx', fx);
     const m = new THREE.InstancedMesh(g, material, cap);
@@ -8994,7 +9291,7 @@ function extCreateEntry(designId, parts) {
   const e = {
     id: designId, cat: d.category, meshes, baseInst, baseMeshes, handles, slotOf: new Map(handles.map((h, k) => [h, k])),
     pos: handles.map(() => new THREE.Vector3()), quat: handles.map(() => new THREE.Quaternion()), scale: new Float32Array(cap).fill(1),
-    mode: new Uint8Array(cap), fx: new Float32Array(cap * 2), baseOn: new Uint8Array(cap).fill(1), dirty: true, shimmer,
+    mode: new Uint8Array(cap), fx: new Float32Array(cap * 3), baseOn: new Uint8Array(cap).fill(1), dirty: true, shimmer,
   };
   return e;
 }
@@ -9007,7 +9304,7 @@ function extTakeOver(e) {
     e.quat[k].copy(rec.quat);
     e.scale[k] = rec.viewScale > 0 ? rec.viewScale : rec.scale;
     e.mode[k] = rec.state === ST.HELD ? FIG_MODE.LOOSE : modeOf(rec.state);
-    e.fx[k * 2] = rec.glow || 0;
+    e.fx[k * 3] = rec.glow || 0;
     kit.setMode(h, FIG_MODE.HIDDEN);
     EXTERN.byHandle.set(h, e);
   }
@@ -9032,7 +9329,7 @@ function updateExternal() {
       for (const m of e.meshes) {
         m.setMatrixAt(n, EXT_M);
         const fx = m.geometry.attributes.extFx;
-        fx.setXY(n, e.fx[k * 2], e.fx[k * 2 + 1]);
+        fx.setXYZ(n, e.fx[k * 3], e.fx[k * 3 + 1], e.fx[k * 3 + 2]);
       }
       if (e.baseOn[k]) {
         if (e.baseInst) e.baseInst.setInstance(nb, EXT_M);
@@ -9157,6 +9454,11 @@ const KIT = {
   setBaseVisible(h, v) {
     if (KIT.ext && KIT.ext.owns(h)) KIT.ext.setBaseVisible(h, v);
     else kit.setBaseVisible(h, v);
+  },
+  /** Aim highlight rim glow (0..1). */
+  setRim(h, amount) {
+    if (KIT.ext && KIT.ext.owns(h)) KIT.ext.setRim(h, amount);
+    else if (kit.setRim) kit.setRim(h, amount);
   },
 };
 
@@ -9284,10 +9586,10 @@ function heapHeightAt(x, z) {
   let best = 0;
   for (const hp of WORLD.heaps) {
     if (hp.crate) continue;
-    const dx = x - hp.x;
-    const dz = z - hp.z;
-    const r2 = (dx * dx + dz * dz) / (hp.r * hp.r);
-    if (r2 < 1) best = Math.max(best, HEAP_MOUND_K * hp.h0 * (1 - r2));
+    const dx = (x - hp.x) / hp.rx;
+    const dz = (z - hp.z) / hp.rz;
+    const r2 = dx * dx + dz * dz;
+    if (r2 < 1) best = Math.max(best, hp.h0 * heapBell(Math.sqrt(r2)));
   }
   return best;
 }
@@ -9307,7 +9609,7 @@ function groundAt(x, z, maxY = 99) {
 function insideCollider(x, z, y) {
   for (const c of WORLD.colliders) {
     if (y >= c.top - 0.01) continue;
-    if (c.tag.startsWith('crate')) continue;
+    if (c.type === 'ellipse' || c.tag.startsWith('crate')) continue;
     if (c.type === 'box') {
       if (x > c.minX && x < c.maxX && z > c.minZ && z < c.maxZ) return c;
     } else if ((x - c.x) * (x - c.x) + (z - c.z) * (z - c.z) < c.r * c.r) return c;
@@ -9362,17 +9664,410 @@ function poseRandom(rec, x, y, z, r, upright = 0.3, lying = 0.5) {
 }
 
 /* ------------------------------------------------------------------------------------------------
+   Piles: the straw heaps are real mounds of figurines. Each heap has a bell-shaped straw core (h0 high); figurines
+   are laid on it one by one and rest on the core or on the figurines below them, following the slope. Every pile
+   figurine knows what it rests on (under) and what rests on it (over): only uncovered ones can be picked up, and when
+   one leaves the pile the ones above settle down onto what is left (no physics, a few position updates).
+   ------------------------------------------------------------------------------------------------ */
+
+/** Height profile of a heap core, r = normalised radius 0..1 (smooth bell: flat top, flat rim). */
+const heapBell = (r) => 0.5 * (1 + Math.cos(Math.PI * Math.min(1, r)));
+
+/** Normalised radius of (x, z) in a heap's ellipse. */
+function heapRadius(hp, x, z) {
+  const dx = (x - hp.x) / hp.rx;
+  const dz = (z - hp.z) / hp.rz;
+  return Math.sqrt(dx * dx + dz * dz);
+}
+
+/** The straw heap (not crate) whose ellipse contains (x, z), scaled by k (k < 1: the inner part). */
+function heapAt(x, z, k = 1) {
+  for (const hp of WORLD.heaps) if (!hp.crate && heapRadius(hp, x, z) < k) return hp;
+  return null;
+}
+
+const PILE_AXIS = new THREE.Vector3();
+/** Where the three footprint circles sit along a figurine's axis. */
+const PILE_T = [0.15, 0.5, 0.85];
+
+/** Updates a pile figurine's footprint (three circles along its axis, radius rho) and its bottom / top height. */
+function pileExtent(rec) {
+  const s = rec.scale;
+  const m = rec.met;
+  PILE_AXIS.set(0, 1, 0).applyQuaternion(rec.quat);
+  const len = m.totalH * s;
+  const rho = Math.max(m.baseR, m.radius * 0.75) * s;
+  const horiz = Math.sqrt(Math.max(0, 1 - PILE_AXIS.y * PILE_AXIS.y));
+  const y0 = rec.pos.y;
+  const y1 = rec.pos.y + PILE_AXIS.y * len;
+  const P = rec.pileP || (rec.pileP = new Float32Array(6));
+  for (let k = 0; k < 3; k++) {
+    P[k * 2] = rec.pos.x + PILE_AXIS.x * len * PILE_T[k];
+    P[k * 2 + 1] = rec.pos.z + PILE_AXIS.z * len * PILE_T[k];
+  }
+  rec.pileRho = rho;
+  rec.pileReach = rho + len * horiz * 0.35;
+  rec.pileBottom = Math.min(y0, y1) - rho * horiz;
+  rec.pileTop = Math.max(y0, y1) + rho * horiz;
+  rec.pileUpright = PILE_AXIS.y > 0.7;
+}
+
+/** True when the footprints of two pile figurines overlap. */
+function pileOverlap(a, b) {
+  const lim = a.pileRho + b.pileRho - 0.02;
+  if (lim <= 0) return false;
+  const A = a.pileP;
+  const B = b.pileP;
+  const mx = A[2] - B[2];
+  const mz = A[3] - B[3];
+  const reach = a.pileReach + b.pileReach;
+  if (mx * mx + mz * mz > reach * reach) return false;
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      const dx = A[i * 2] - B[j * 2];
+      const dz = A[i * 2 + 1] - B[j * 2 + 1];
+      if (dx * dx + dz * dz < lim * lim) return true;
+    }
+  }
+  return false;
+}
+
+/** Highest straw core height under a figurine's footprint. */
+function pileCoreUnder(rec) {
+  let h = 0;
+  for (let k = 0; k < 3; k++) h = Math.max(h, heapHeightAt(rec.pileP[k * 2], rec.pileP[k * 2 + 1]));
+  return h;
+}
+
+/** Moves a pile figurine vertically by dy (keeps its cached extent in step). */
+function pileShift(rec, dy) {
+  rec.pos.y += dy;
+  rec.groundY += dy;
+  rec.pileBottom += dy;
+  rec.pileTop += dy;
+}
+
+/** True when another pile figurine rests on this one (it cannot be grabbed until those are taken). */
+function isCovered(rec) {
+  return rec.heap >= 0 && !!(rec.over && rec.over.length);
+}
+
+/** Lowers a pile figurine onto what is left below it, then the ones resting on it (after a removal). */
+function pileSettle(rec) {
+  let floor = pileCoreUnder(rec);
+  for (const o of rec.under) floor = Math.max(floor, o.pileTop - 0.04);
+  const dy = floor - rec.pileBottom;
+  if (dy > -0.01) return;
+  pileShift(rec, dy);
+  syncRec(rec);
+  hashUpdate(rec);
+  for (const o of rec.over) pileSettle(o);
+}
+
+/** Takes a figurine out of its heap (picked up, summoned, thrown, shelved by an elf...): the ones above settle. */
+function leavePile(rec) {
+  const hp = rec.heap >= 0 ? WORLD.heaps[rec.heap] : null;
+  rec.heap = -1;
+  if (!hp || !hp.pile) return;
+  KIT.setBaseVisible(rec.h, true);
+  const i = hp.pile.indexOf(rec);
+  if (i >= 0) hp.pile.splice(i, 1);
+  for (const u of rec.under || []) {
+    const k = u.over.indexOf(rec);
+    if (k >= 0) u.over.splice(k, 1);
+  }
+  const above = rec.over || [];
+  rec.under = [];
+  rec.over = [];
+  for (const o of above) {
+    const k = o.under.indexOf(rec);
+    if (k >= 0) o.under.splice(k, 1);
+    pileSettle(o);
+  }
+}
+
+/* ---- pile surface grid: placing figurines ------------------------------------------------------------- */
+
+/** Cell size of the pile surface grid (metres). */
+const PILE_CELL = 0.06;
+/** How high the figurines may pile up above the core peak. */
+const PILE_MAX_ABOVE = 0.75;
+const PILE_U = new THREE.Vector3();
+const PILE_F = new THREE.Vector3();
+const PILE_W = new THREE.Vector3();
+
+/**
+ * Height grid of a pile surface: the straw core plus the top of every figurine laid on it, the figurine that raised
+ * each cell (handle, -1 = straw) and the cells of standing figurines (nothing rests on a head).
+ */
+function pileGrid(hp) {
+  const nx = Math.ceil((hp.rx * 2 + 0.6) / PILE_CELL);
+  const nz = Math.ceil((hp.rz * 2 + 0.6) / PILE_CELL);
+  const g = {
+    x0: hp.x - (nx * PILE_CELL) / 2, z0: hp.z - (nz * PILE_CELL) / 2, nx, nz,
+    h: new Float32Array(nx * nz), owner: new Int32Array(nx * nz).fill(-1), block: new Uint8Array(nx * nz),
+  };
+  for (let iz = 0; iz < nz; iz++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const x = g.x0 + (ix + 0.5) * PILE_CELL;
+      const z = g.z0 + (iz + 0.5) * PILE_CELL;
+      g.h[ix + iz * nx] = hp.h0 * heapBell(heapRadius(hp, x, z));
+    }
+  }
+  return g;
+}
+
+/** Visits the grid cells within `rad` of (x, z): fn(index). */
+function pileCells(g, x, z, rad, fn) {
+  const ix0 = Math.max(0, Math.floor((x - rad - g.x0) / PILE_CELL));
+  const ix1 = Math.min(g.nx - 1, Math.floor((x + rad - g.x0) / PILE_CELL));
+  const iz0 = Math.max(0, Math.floor((z - rad - g.z0) / PILE_CELL));
+  const iz1 = Math.min(g.nz - 1, Math.floor((z + rad - g.z0) / PILE_CELL));
+  const r2 = rad * rad;
+  for (let iz = iz0; iz <= iz1; iz++) {
+    const cz = g.z0 + (iz + 0.5) * PILE_CELL - z;
+    for (let ix = ix0; ix <= ix1; ix++) {
+      const cx = g.x0 + (ix + 0.5) * PILE_CELL - x;
+      if (cx * cx + cz * cz <= r2) fn(ix + iz * g.nx);
+    }
+  }
+}
+
+/** Raises the grid with an existing pile figurine (its three footprint circles at its top height). */
+function pileRaster(g, rec) {
+  for (let k = 0; k < 3; k++) {
+    pileCells(g, rec.pileP[k * 2], rec.pileP[k * 2 + 1], rec.pileRho, (i) => {
+      if (rec.pileTop > g.h[i]) {
+        g.h[i] = rec.pileTop;
+        g.owner[i] = rec.h;
+      }
+      if (rec.pileUpright) g.block[i] = 1;
+    });
+  }
+}
+
+/** Grid of a pile from its current figurines (for adding one at run time). */
+function pileGridNow(hp) {
+  const g = pileGrid(hp);
+  const list = hp.pile.slice().sort((a, b) => a.pileTop - b.pileTop);
+  for (const rec of list) pileRaster(g, rec);
+  return g;
+}
+
+const PILE_S = new Float32Array(7);
+const PILE_TS = [0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6, 1];
+
+/**
+ * Tries a figurine on the pile at (x, z): lying along direction `dir` (rolled `roll` away from face-up) and resting on
+ * what is below it along its whole length (it leans across the figurines it lies on), or standing (only on bare
+ * straw). Returns { stack, top } or null when the spot is not possible; with `commit` the pose is applied, the grid
+ * raised and the figurine linked to the ones it rests on.
+ */
+function pileTry(rec, hp, g, x, z, kind, dir, roll, commit) {
+  const s = rec.scale;
+  const m = rec.met;
+  const len = m.totalH * s;
+  const rho = Math.max(m.baseR, m.radius * 0.75) * s;
+  const core = hp.h0 * heapBell(heapRadius(hp, x, z));
+  if (kind === 'upright') {
+    let h = 0;
+    let busy = false;
+    pileCells(g, x, z, rho, (i) => {
+      if (g.owner[i] >= 0 || g.block[i]) busy = true;
+      h = Math.max(h, g.h[i]);
+    });
+    if (busy) return null;
+    const res = { stack: 0, top: h + len };
+    if (!commit) return res;
+    poseUpright(rec, x, h, z, dir);
+    pileExtent(rec);
+    pileRaster(g, rec);
+    rec.under = [];
+    hp.pile.push(rec);
+    KIT.setBaseVisible(rec.h, true);
+    return res;
+  }
+  const dx = Math.cos(dir);
+  const dz = Math.sin(dir);
+  let blocked = false;
+  for (let k = 0; k < 7; k++) {
+    const t = PILE_TS[k] - 0.5;
+    let h = 0;
+    pileCells(g, x + dx * len * t, z + dz * len * t, rho * 0.85, (i) => {
+      if (g.block[i]) blocked = true;
+      h = Math.max(h, g.h[i]);
+    });
+    PILE_S[k] = h;
+  }
+  if (blocked) return null;
+  // Contact line under the figure: through the high points of each half, raised to clear every sample, slope capped.
+  let sA = 0;
+  let sB = 0;
+  for (let k = 0; k <= 3; k++) sA = Math.max(sA, PILE_S[k]);
+  for (let k = 3; k < 7; k++) sB = Math.max(sB, PILE_S[k]);
+  let b = clampTo((sB - sA) * 2, -len * 0.6, len * 0.6);
+  let a = sA - 0.25 * b;
+  let lift = -1e9;
+  for (let k = 0; k < 7; k++) lift = Math.max(lift, PILE_S[k] - 0.03 - (a + b * PILE_TS[k]));
+  a += lift;
+  const top = Math.max(a, a + b) + 2 * rho;
+  const res = { stack: a + Math.min(0, b) - core, top };
+  if (!commit) return res;
+  // Pose: the axis runs from the base (t = 0) to the head (t = 1), a figure radius above the contact line.
+  const hl = Math.sqrt(Math.max(0.01, len * len - b * b));
+  PILE_U.set(dx * hl, b, dz * hl).normalize();
+  rec.quat.setFromUnitVectors(UP_AXIS, PILE_U);
+  // Roll around the axis: the front (local +Z) faces up, give or take `roll`.
+  PILE_F.set(0, 0, 1).applyQuaternion(rec.quat);
+  PILE_W.copy(UP_AXIS).addScaledVector(PILE_U, -PILE_U.y).normalize();
+  const ang = Math.atan2(PILE_F.clone().cross(PILE_W).dot(PILE_U), PILE_F.dot(PILE_W));
+  rec.quat.premultiply(tq2.setFromAxisAngle(PILE_U, ang + roll));
+  rec.pos.set(x - dx * (hl / 2), a + rho * 0.92, z - dz * (hl / 2));
+  rec.lying = true;
+  rec.groundY = a;
+  pileExtent(rec);
+  // Supports: the figurines whose top makes the contact line (within a few centimetres).
+  const under = new Set();
+  for (let k = 0; k < 7; k++) {
+    const t = PILE_TS[k] - 0.5;
+    const line = a + b * PILE_TS[k];
+    pileCells(g, x + dx * hl * t, z + dz * hl * t, rho * 0.85, (i) => {
+      if (g.owner[i] >= 0 && g.h[i] > line - 0.07) under.add(g.owner[i]);
+    });
+  }
+  rec.under = [...under].map((h) => REC[h]).filter((o) => o && o !== rec && o.heap === WORLD.heaps.indexOf(hp));
+  for (const o of rec.under) o.over.push(rec);
+  for (let k = 0; k < 7; k++) {
+    const t = PILE_TS[k] - 0.5;
+    const top = a + b * PILE_TS[k] + 2 * rho * 0.9;
+    pileCells(g, x + dx * hl * t, z + dz * hl * t, rho, (i) => {
+      if (top > g.h[i]) {
+        g.h[i] = top;
+        g.owner[i] = rec.h;
+      }
+    });
+  }
+  hp.pile.push(rec);
+  // In a pile only the figure shows: the bases' dark undersides would turn the mound into a heap of black discs.
+  KIT.setBaseVisible(rec.h, false);
+  return res;
+}
+
+/** Best of a few candidate spots near (x, z) (spread `spread` metres), then committed. Returns false if none fit. */
+function pilePlace(rec, hp, hi, g, r, x, z, spread, tries, uprightP) {
+  let best = null;
+  for (let t = 0; t < tries; t++) {
+    let cx = x;
+    let cz = z;
+    if (spread > 0) {
+      const a = r() * Math.PI * 2;
+      const rr = Math.sqrt(r()) * spread;
+      cx += Math.cos(a) * rr;
+      cz += Math.sin(a) * rr;
+    }
+    if (heapRadius(hp, cx, cz) > 0.95) continue;
+    const kind = r() < uprightP ? 'upright' : 'lying';
+    const dir = r() * Math.PI * 2;
+    const roll = (r() - 0.5) * 2.2;
+    const res = pileTry(rec, hp, g, cx, cz, kind, dir, roll, false);
+    if (!res) continue;
+    const score = res.stack + (res.top > hp.h0 + PILE_MAX_ABOVE ? 1 : 0) + r() * 0.02;
+    if (!best || score < best.score) best = { score, cx, cz, kind, dir, roll };
+  }
+  if (!best) return false;
+  rec.over = [];
+  rec.heap = hi;
+  pileTry(rec, hp, g, best.cx, best.cz, best.kind, best.dir, best.roll, true);
+  return true;
+}
+
+/** Adds a loose figurine to the pile around (x, z) (recovered, dropped or thrown onto a heap). */
+function joinPile(rec, hp, x, z, kind = 'lying') {
+  if (rec.heap >= 0) leavePile(rec);
+  const hi = WORLD.heaps.indexOf(hp);
+  const g = pileGridNow(hp);
+  rec.under = [];
+  rec.over = [];
+  if (!pilePlace(rec, hp, hi, g, Math.random, x, z, 0.35, 10, kind === 'upright' ? 1 : 0)) {
+    pilePlace(rec, hp, hi, g, Math.random, x, z, 0.8, 16, 0);
+  }
+  if (rec.heap < 0) {
+    // Nowhere to rest on the pile: stand it at the foot of the heap.
+    rec.heap = -1;
+    poseUpright(rec, x, groundAt(x, z), z, Math.random() * Math.PI * 2);
+  }
+}
+
+/**
+ * Builds a pile from scratch (deterministic from the seeded rng): each figurine tries several spots over the whole heap
+ * and takes the one where it rests lowest above the straw, so the core is covered first and the figurines then stack
+ * up into a mound (about two layers).
+ */
+function buildPile(hp, hi, list, r) {
+  hp.pile = [];
+  const g = pileGrid(hp);
+  for (const rec of list) {
+    rec.under = [];
+    rec.over = [];
+    rec.state = ST.LOOSE;
+    if (!pilePlace(rec, hp, hi, g, r, hp.x, hp.z, Math.max(hp.rx, hp.rz) * 0.95, 8, 0.12)) {
+      pilePlace(rec, hp, hi, g, r, hp.x, hp.z, Math.max(hp.rx, hp.rz) * 0.95, 30, 0);
+    }
+    if (rec.heap !== hi) {
+      // Pile full everywhere (should not happen with the configured shares): lay it at the foot.
+      const a = r() * Math.PI * 2;
+      poseLying(rec, hp.x + Math.cos(a) * hp.rx * 1.05, 0, hp.z + Math.sin(a) * hp.rz * 1.05, a, r());
+      rec.heap = -1;
+    }
+  }
+}
+
+/** Rebuilds the pile links of every heap from the figurines' current poses (after loading a save). */
+function rebuildPiles() {
+  for (const rec of REC) {
+    rec.under = [];
+    rec.over = [];
+  }
+  WORLD.heaps.forEach((hp, hi) => {
+    if (hp.crate) return;
+    const list = REC.filter((rec) => rec.heap === hi && rec.state === ST.LOOSE);
+    hp.pile = [];
+    for (const rec of list) {
+      rec.under = [];
+      rec.over = [];
+      pileExtent(rec);
+      KIT.setBaseVisible(rec.h, rec.pileUpright);
+    }
+    list.sort((a, b) => a.pileBottom - b.pileBottom);
+    for (const rec of list) {
+      for (const o of hp.pile) {
+        if (pileOverlap(rec, o) && o.pileTop > rec.pileBottom - 0.08 && o.pileBottom < rec.pileBottom - 0.02) {
+          rec.under.push(o);
+          o.over.push(rec);
+        }
+      }
+      hp.pile.push(rec);
+    }
+    // Anything left hanging (it rested on a figurine that is no longer in the pile) settles down.
+    for (const rec of list) pileSettle(rec);
+  });
+}
+
+/* ------------------------------------------------------------------------------------------------
    Spawning (deterministic from the seed; DESIGN.md section 5 scaled to 10 copies per design)
    ------------------------------------------------------------------------------------------------ */
 
 function resetRecords() {
   for (const rec of REC) {
     hashRemove(rec);
+    if (kit && !rec.actor) KIT.setBaseVisible(rec.h, true);
     rec.state = ST.HIDDEN;
     rec.slot = null;
     rec.slotPos = -1;
     rec.paid = false;
     rec.heap = -1;
+    rec.under = [];
+    rec.over = [];
     rec.wild = null;
     rec.spot = false;
     rec.fly = null;
@@ -9437,28 +10132,7 @@ function spawnAll(seed) {
     const list = pool.slice(k, k + hp.quota);
     k += hp.quota;
     if (!hp.crate) {
-      hp.h0 = clampTo(0.06 + 0.0016 * list.length, 0.1, 0.34);
-      const placed = [];
-      list.forEach((rec, i) => {
-        let x = 0;
-        let z = 0;
-        for (let tries = 0; tries < 10; tries++) {
-          const rr = hp.r * Math.sqrt(r()) * 0.95;
-          const a = r() * Math.PI * 2;
-          x = hp.x + Math.cos(a) * rr;
-          z = hp.z + Math.sin(a) * rr;
-          if (!placed.some(([px, pz]) => (px - x) * (px - x) + (pz - z) * (pz - z) < 0.0036)) break;
-        }
-        placed.push([x, z]);
-        const dx = (x - hp.x) / hp.r;
-        const dz = (z - hp.z) / hp.r;
-        const hf = HEAP_MOUND_K * hp.h0 * Math.max(0, 1 - dx * dx - dz * dz);
-        // Rest on the straw surface; later figurines lie a little higher, on top of the earlier ones.
-        const v = i / Math.max(1, list.length);
-        poseRandom(rec, x, hf + v * 0.03, z, r);
-        rec.state = ST.LOOSE;
-        rec.heap = hi;
-      });
+      buildPile(hp, hi, list, r);
     } else {
       const b = hp.box;
       list.forEach((rec, i) => {
@@ -9476,18 +10150,30 @@ function spawnAll(seed) {
           const layer = i % 3;
           const x = lerp(b.minX + 0.09, b.maxX - 0.09, r());
           const z = lerp(b.minZ + 0.09, b.maxZ - 0.09, r());
-          poseRandom(rec, x, 0.03 + layer * 0.13, z, r, 0.2, 0.7);
+          poseRandom(rec, x, 0.03 + layer * 0.065 * FIG_SCALE, z, r, 0.2, 0.7);
         }
         rec.state = ST.LOOSE;
         rec.heap = hi;
       });
     }
   });
-  // Runaway nifflers start on top of heaps H1..H5.
+  // One consistent set of pile links from the final poses (the same pass a loaded save gets); anything the surface
+  // grid left hanging settles onto what is really below it.
+  rebuildPiles();
+  // Runaway nifflers start at the foot of the heaps (round robin over the straw heaps, never in a crate).
+  const piles = WORLD.heaps.filter((hp) => !hp.crate);
   for (const rec of REC) {
     if (!rec.wild || rec.wild.kind !== 'scurrier') continue;
-    const hp = WORLD.heaps[rec.wild.heapIdx % 5];
-    poseUpright(rec, hp.x + (r() - 0.5) * 0.3, HEAP_MOUND_K * hp.h0, hp.z + (r() - 0.5) * 0.3, r() * 6.28);
+    const hp = piles[rec.wild.heapIdx % piles.length];
+    let nx = hp.x;
+    let nz = hp.z;
+    for (let t = 0; t < 8; t++) {
+      const a = r() * Math.PI * 2;
+      nx = hp.x + Math.cos(a) * hp.rx * 1.12;
+      nz = hp.z + Math.sin(a) * hp.rz * 1.12;
+      if (inRoom(nx, nz) && !insideCollider(nx, nz, 0.05)) break;
+    }
+    poseUpright(rec, nx, groundAt(nx, nz), nz, r() * 6.28);
     rec.state = ST.WILD;
   }
   for (const rec of REC) {
@@ -9547,6 +10233,7 @@ function refreshAllPlates() {
 
 /** Puts a record into a slot position (no money, no events). */
 function seatInSlot(rec, slot, posIdx) {
+  if (rec.heap >= 0) leavePile(rec);
   rec.slot = slot;
   rec.slotPos = posIdx;
   slot.occupants[posIdx] = rec.h;
@@ -9748,33 +10435,84 @@ function popStack() {
 const STACK_LOCAL = new THREE.Vector3();
 const STACK_Q = new THREE.Quaternion();
 const STACK_TURN = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.12, -0.55, 0));
+const STACK_TILT = new THREE.Quaternion();
+const HAND_P = new THREE.Vector3();
+const HAND_C = new THREE.Vector3();
+const HAND_Q = new THREE.Quaternion();
+/** The handle shown as the big view model last frame (a change starts the swap animation). */
+const STACK_STATE = { topH: -1, spin: 0 };
 
-/** Poses the visible part of the stack in front of the camera (lower right of the view). */
-function updateStackView(t) {
+/**
+ * Starts the flight of a held figurine from its current world pose to its place in the hand (picked up, caught,
+ * summoned, or swapped to the top). The world pose is the one last drawn, including the aim-highlight pop.
+ */
+function startHandFlight(rec, dur = STACK_VIEW.flyS) {
+  const f = rec.hand || (rec.hand = { t: 1, dur: 0.3, p0: new THREE.Vector3(), q0: new THREE.Quaternion(), s0: 1 });
+  f.p0.copy(rec.pos);
+  if (rec.hiLift) f.p0.y += rec.hiLift;
+  f.q0.copy(rec.quat);
+  f.s0 = rec.viewScale > 0 ? rec.viewScale : rec.scale;
+  f.t = 0;
+  f.dur = dur;
+}
+
+/**
+ * Poses the held figurines in front of the camera: the selected one large and slowly turning in the lower right of
+ * the view (readable at TV distance; the HUD panel beside it lists the rest). The others wait just below the view,
+ * hidden, so the next one rises into the hand when the stack is cycled or the top one is placed.
+ */
+function updateStackView(t, dt = 1 / 60) {
   const n = GAME.stack.length;
-  const shown = Math.min(STACK_VIEW.shown, n);
+  const V = STACK_VIEW;
   const aspectK = Math.min(1, camera.aspect / 1.6);
+  const topRec = n ? REC[GAME.stack[n - 1]] : null;
+  if (topRec && topRec.h !== STACK_STATE.topH && STACK_STATE.topH >= 0 && topRec.state === ST.HELD && !(topRec.hand && topRec.hand.t < 1)) {
+    startHandFlight(topRec, V.swapS);
+  }
+  STACK_STATE.topH = topRec ? topRec.h : -1;
+  STACK_STATE.spin += dt * V.spin;
+  // Binocular zoom: the hand lowers out of the narrowed view (it would otherwise fill the screen), then hides.
+  const lower = ZOOM.k * 0.12;
   for (let i = 0; i < n; i++) {
     const rec = REC[GAME.stack[n - 1 - i]];
     if (rec.state !== ST.HELD) continue;
-    if (i >= shown) {
-      KIT.setMode(rec.h, FIG_MODE.HIDDEN);
-      continue;
-    }
-    KIT.setMode(rec.h, FIG_MODE.LOOSE);
     const top = i === 0;
-    const sc = (top ? STACK_VIEW.topScale : STACK_VIEW.scale) * rec.scale;
-    const bob = Math.sin(t * 2.1 + i * 0.9) * 0.004;
-    if (top) STACK_LOCAL.set(STACK_VIEW.x * aspectK, STACK_VIEW.y + bob, STACK_VIEW.z);
-    else STACK_LOCAL.set((STACK_VIEW.x + 0.05 + 0.034 * i) * aspectK, STACK_VIEW.y + 0.012 * i + bob, STACK_VIEW.z - 0.05 - 0.012 * i);
-    const spin = rec.spinT > 0 ? (1 - rec.spinT) * Math.PI * 2 : 0;
-    STACK_Q.copy(STACK_TURN);
-    if (spin) STACK_Q.multiply(tq2.setFromAxisAngle(UP_AXIS, spin));
-    rec.quat.copy(camera.quaternion).multiply(STACK_Q);
-    tv1.set(0, -rec.met.centerY * sc / rec.scale, 0).applyQuaternion(rec.quat);
-    rec.pos.copy(STACK_LOCAL).applyMatrix4(camera.matrixWorld).add(tv1);
-    rec.viewScale = sc;
-    KIT.setPose(rec.h, rec.pos, rec.quat, sc);
+    KIT.setMode(rec.h, top && ZOOM.k <= 0.5 ? FIG_MODE.LOOSE : FIG_MODE.HIDDEN);
+    const h = rec.met.totalH;
+    const sc = clampTo((top ? V.topH : V.waitH) / h, top ? V.minS : 0.12, top ? V.maxS : 0.8) * rec.scale;
+    const bob = top ? Math.sin(t * 2.1) * 0.0025 : 0;
+    STACK_LOCAL.set(V.x * aspectK, (top ? V.y : V.waitY) + bob - lower, V.z);
+    const flourish = rec.spinT > 0 ? (1 - rec.spinT) * Math.PI * 2 : 0;
+    if (top) {
+      // Slow turntable spin around the figure's own axis, tipped a little towards the player.
+      STACK_TILT.setFromAxisAngle(X_AXIS, V.tilt);
+      STACK_Q.copy(STACK_TILT).multiply(tq2.setFromAxisAngle(UP_AXIS, STACK_STATE.spin + flourish - 0.5));
+    } else {
+      STACK_Q.copy(STACK_TURN);
+      if (flourish) STACK_Q.multiply(tq2.setFromAxisAngle(UP_AXIS, flourish));
+    }
+    HAND_Q.copy(camera.quaternion).multiply(STACK_Q);
+    tv1.set(0, -rec.met.centerY * sc, 0).applyQuaternion(HAND_Q);
+    HAND_P.copy(STACK_LOCAL).applyMatrix4(camera.matrixWorld).add(tv1);
+    const f = rec.hand;
+    if (f && f.t < 1) {
+      // Fly to the hand along a gentle arc, easing into the view-model pose.
+      f.t = Math.min(1, f.t + dt / f.dur);
+      const e = 1 - (1 - f.t) * (1 - f.t) * (1 - f.t);
+      HAND_C.addVectors(f.p0, HAND_P).multiplyScalar(0.5);
+      HAND_C.y += Math.min(0.25, f.p0.distanceTo(HAND_P) * 0.25);
+      const a = (1 - e) * (1 - e);
+      const b = 2 * (1 - e) * e;
+      const c = e * e;
+      rec.pos.set(f.p0.x * a + HAND_C.x * b + HAND_P.x * c, f.p0.y * a + HAND_C.y * b + HAND_P.y * c, f.p0.z * a + HAND_C.z * b + HAND_P.z * c);
+      rec.quat.slerpQuaternions(f.q0, HAND_Q, e);
+      rec.viewScale = lerp(f.s0, sc, e);
+    } else {
+      rec.pos.copy(HAND_P);
+      rec.quat.copy(HAND_Q);
+      rec.viewScale = sc;
+    }
+    KIT.setPose(rec.h, rec.pos, rec.quat, rec.viewScale);
   }
 }
 
@@ -9803,6 +10541,7 @@ function actionPick() {
 
 /** Moves a world figurine into the stack (from a heap, the floor, a shelf, or as a caught runaway). */
 function takeIntoStack(rec, byHand) {
+  startHandFlight(rec);
   if (rec.slot) unseat(rec);
   if (rec.state === ST.WILD) {
     rec.wild = null;
@@ -9815,7 +10554,7 @@ function takeIntoStack(rec, byHand) {
     toast(fmt(TXT.toastHidden, { name: rec.d.nameHu }), 'gold');
     sfx('sparkle');
   }
-  rec.heap = -1;
+  leavePile(rec);
   rec.glow = 0;
   KIT.setFx(rec.h, 0, 0);
   pushStack(rec);
@@ -9878,6 +10617,7 @@ function startScript(rec, x, y, z, yaw, dur, kind, data) {
     const i = SIMS.indexOf(rec);
     if (i >= 0) SIMS.splice(i, 1);
   }
+  if (rec.heap >= 0) leavePile(rec);
   setState(rec, ST.SCRIPT);
   KIT.setMode(rec.h, FIG_MODE.LOOSE);
   const f = rec.fly || (rec.fly = { p0: new THREE.Vector3(), p1: new THREE.Vector3(), c: new THREE.Vector3(), q0: new THREE.Quaternion(), q1: new THREE.Quaternion(), s0: 1, t: 0, dur: 0.25, kind: '', data: null });
@@ -9943,7 +10683,10 @@ function finishScript(rec, f) {
   } else if (f.kind === 'floor') {
     const x = f.p1.x;
     const z = f.p1.z;
-    poseUpright(rec, x, f.p1.y, z, Math.atan2(2 * (f.q1.w * f.q1.y), 1 - 2 * f.q1.y * f.q1.y));
+    const yaw = Math.atan2(2 * (f.q1.w * f.q1.y), 1 - 2 * f.q1.y * f.q1.y);
+    const hp = heapAt(x, z, 0.98);
+    if (hp) joinPile(rec, hp, x, z, 'upright', yaw);
+    else poseUpright(rec, x, f.p1.y, z, yaw);
     rec.state = -1;
     setState(rec, ST.LOOSE);
     syncRec(rec);
@@ -10031,7 +10774,7 @@ function updateFlourish(dt) {
       HOPPERS.splice(i, 1);
       continue;
     }
-    rec.pos.y = rec.hopBase + 0.02 * Math.sin((1 - rec.hopT) * Math.PI);
+    rec.pos.y = rec.hopBase + 0.02 * FIG_SCALE * Math.sin((1 - rec.hopT) * Math.PI);
     KIT.setPose(rec.h, rec.pos, rec.quat, rec.scale);
     if (rec.hopT <= 0) {
       rec.pos.y = rec.hopBase;
@@ -10079,7 +10822,7 @@ function startSim(rec) {
   KIT.setMode(rec.h, FIG_MODE.LOOSE);
   rec.bounces = 0;
   rec.simT = 0;
-  rec.heap = -1;
+  leavePile(rec);
   rec.viewScale = 0;
   if (SIMS.length >= PHYS.maxSim) {
     settleNow(SIMS.shift(), true);
@@ -10113,6 +10856,7 @@ function stepPhysics(dt) {
     // Colliders (walls, furniture): land on tops from above, otherwise bounce horizontally.
     for (const c of WORLD.colliders) {
       let inside = false;
+      if (c.type === 'ellipse') continue;
       if (c.type === 'box') inside = rec.pos.x > c.minX && rec.pos.x < c.maxX && rec.pos.z > c.minZ && rec.pos.z < c.maxZ;
       else inside = (rec.pos.x - c.x) * (rec.pos.x - c.x) + (rec.pos.z - c.z) * (rec.pos.z - c.z) < c.r * c.r;
       if (!inside || rec.pos.y - rad > c.top) continue;
@@ -10176,12 +10920,14 @@ function settleNow(rec, instant) {
   let z = rec.pos.z;
   if (!inRoom(x, z) || insideCollider(x, z, 0.05)) {
     const hp = nearestHeap(x, z);
-    x = hp.x + (Math.random() - 0.5) * hp.r;
-    z = hp.z + (Math.random() - 0.5) * hp.r;
+    x = hp.x + (Math.random() - 0.5) * hp.rx;
+    z = hp.z + (Math.random() - 0.5) * hp.rz;
   }
   const g = groundAt(x, z, rec.pos.y + 0.05);
   const yaw = Math.atan2(rec.vel.x, rec.vel.z) + (Math.random() - 0.5);
-  if (rec.d.ownBase || Math.random() < 0.35) poseUpright(rec, x, g, z, yaw);
+  const hp = heapAt(x, z, 0.98);
+  if (hp) joinPile(rec, hp, x, z, Math.random() < 0.2 ? 'upright' : 'lying', yaw);
+  else if (rec.d.ownBase || Math.random() < 0.35) poseUpright(rec, x, g, z, yaw);
   else poseLying(rec, x, g, z, yaw, Math.random());
   rec.vel.set(0, 0, 0);
   rec.homing = false;
@@ -10260,11 +11006,10 @@ function recoverLost(force) {
     if (rec.oobT < 2 && !force) continue;
     const hp = nearestHeap(rec.pos.x, rec.pos.z);
     const a = Math.random() * Math.PI * 2;
-    const rr = Math.random() * hp.r * 0.5;
-    const x = hp.x + Math.cos(a) * rr;
-    const z = hp.z + Math.sin(a) * rr;
-    poseRandom(rec, x, heapHeightAt(x, z), z, Math.random);
-    rec.heap = WORLD.heaps.indexOf(hp);
+    const rr = Math.random() * 0.5;
+    const x = hp.x + Math.cos(a) * rr * hp.rx;
+    const z = hp.z + Math.sin(a) * rr * hp.rz;
+    joinPile(rec, hp, x, z, 'lying');
     rec.oobT = 0;
     syncRec(rec);
     hashUpdate(rec);
@@ -10292,6 +11037,8 @@ function updateBlobs() {
     const s = rec.state;
     if (s !== ST.LOOSE && s !== ST.SHELF_OK && s !== ST.SHELF_WRONG && s !== ST.WILD) continue;
     if (KIT.ext && KIT.ext.hiddenBase(rec.h)) continue;
+    // Figurines in a straw pile rest on its curved surface or on each other: no flat contact shadow.
+    if (rec.heap >= 0 && rec.state === ST.LOOSE && !WORLD.heaps[rec.heap].crate) continue;
     const r = (rec.lying ? rec.met.pickR * 1.1 : Math.max(0.03, rec.met.baseR || rec.met.radius) * 1.7) * rec.scale;
     tm1.compose(tv1.set(rec.lying ? rec.pickC.x : rec.pos.x, rec.groundY + 0.003, rec.lying ? rec.pickC.z : rec.pos.z), tq1.identity(), tv2.set(r * 2, 1, r * 2));
     BLOBS.mesh.setMatrixAt(n++, tm1);
@@ -10543,7 +11290,7 @@ function updateGlints(t) {
         SPOT_GLINTS.idx.set(rec.h, gi);
       }
       GLINTS.batch.setCenter(gi, rec.pickC.x, rec.pickC.y + rec.met.totalH * 0.35, rec.pickC.z);
-      GLINTS.batch.setSize(gi, 0.07 * pulse, 0.07 * pulse);
+      GLINTS.batch.setSize(gi, 0.07 * FIG_SCALE * pulse, 0.07 * FIG_SCALE * pulse);
     } else if (SPOT_GLINTS.idx.has(rec.h)) {
       GLINTS.batch.setSize(SPOT_GLINTS.idx.get(rec.h), 0, 0);
     }
@@ -10679,7 +11426,7 @@ function updateSnitch(dt, t) {
 function snitchTargetScore(eye, dir, reach, cone) {
   if (SNITCH.state === 'off' || !SNITCH.flyer) return 1e9;
   if (SNITCH.state === 'perch') {
-    const { a, dist } = angleTo(eye, dir, SNITCH.pos, 0.04);
+    const { a, dist } = angleTo(eye, dir, SNITCH.pos, 0.04 * FIG_SCALE);
     if (dist > reach || a > cone * 1.6) return 1e9;
     return a / (cone * 1.6) + 0.25 * dist / reach - 0.15;
   }
@@ -10705,8 +11452,11 @@ function catchSnitch() {
   GAME.snitch.caught = true;
   rec.wild = null;
   rec.pos.copy(SNITCH.pos);
+  rec.pos.y -= rec.met.centerY * rec.scale;
   rec.quat.identity();
+  rec.viewScale = 0;
   puff(SNITCH.pos.x, SNITCH.pos.y, SNITCH.pos.z, 0.25);
+  startHandFlight(rec);
   pushStack(rec);
   toast(TXT.toastSnitch, 'gold');
   sfx('sparkle');
@@ -10718,6 +11468,20 @@ function catchSnitch() {
 /* ------------------------------------------------------------------------------------------------
    Runaway nifflers (SNIFF → RUN → sometimes DIG)
    ------------------------------------------------------------------------------------------------ */
+
+/** A niffler that dug into a heap pops out at its foot, on free floor. */
+function nifflerPopOut(rec) {
+  const hp = nearestHeap(rec.pos.x, rec.pos.z);
+  for (let t = 0; t < 10; t++) {
+    const a = Math.random() * Math.PI * 2;
+    const x = hp.x + Math.cos(a) * hp.rx * 1.1;
+    const z = hp.z + Math.sin(a) * hp.rz * 1.1;
+    if (!inRoom(x, z) || insideCollider(x, z, 0.05)) continue;
+    rec.pos.set(x, 0, z);
+    break;
+  }
+  rec.pos.y = groundAt(rec.pos.x, rec.pos.z, 0.3);
+}
 function updateNifflers(dt, t) {
   const lure = GAME.boons.nifflerLure;
   for (const rec of REC) {
@@ -10726,9 +11490,7 @@ function updateNifflers(dt, t) {
     if (!SETTINGS.wild && w.mode !== 'sniff') {
       if (w.mode === 'dig') {
         // Pop a digging niffler back out (as the dig end does) so it is visible and aimable again.
-        const hp = nearestHeap(rec.pos.x, rec.pos.z);
-        rec.pos.set(hp.x + (Math.random() - 0.5) * 0.4, 0, hp.z + (Math.random() - 0.5) * 0.4);
-        rec.pos.y = heapHeightAt(rec.pos.x, rec.pos.z);
+        nifflerPopOut(rec);
         KIT.setMode(rec.h, FIG_MODE.LOOSE);
       }
       w.mode = 'sniff';
@@ -10739,7 +11501,7 @@ function updateNifflers(dt, t) {
       w.hop = (w.hop + dt * 9) % (Math.PI * 2);
       const wob = Math.sin(t * 7 + rec.h) * 0.25;
       rec.quat.setFromAxisAngle(UP_AXIS, w.yaw || 0).multiply(tq1.setFromAxisAngle(Z_AXIS, wob * 0.2));
-      rec.pos.y = groundAt(rec.pos.x, rec.pos.z, 1) + Math.max(0, Math.sin(w.hop)) * 0.012;
+      rec.pos.y = groundAt(rec.pos.x, rec.pos.z, 1) + Math.max(0, Math.sin(w.hop)) * 0.012 * FIG_SCALE;
       if (w.t <= 0 && SETTINGS.wild) {
         if (Math.random() < 0.25) {
           w.mode = 'dig';
@@ -10769,7 +11531,7 @@ function updateNifflers(dt, t) {
       } else {
         const nx = rec.pos.x + (dx / d) * speed * dt;
         const nz = rec.pos.z + (dz / d) * speed * dt;
-        if (insideCollider(nx, nz, 0.05) || !inRoom(nx, nz)) {
+        if (insideCollider(nx, nz, 0.05) || !inRoom(nx, nz) || heapAt(nx, nz, 1.02)) {
           w.mode = 'sniff';
           w.t = 0.5;
         } else {
@@ -10777,15 +11539,13 @@ function updateNifflers(dt, t) {
           rec.pos.z = nz;
         }
         w.yaw = Math.atan2(dx, dz);
-        rec.pos.y = groundAt(rec.pos.x, rec.pos.z, 1) + Math.abs(Math.sin(t * 16 + rec.h)) * 0.01;
+        rec.pos.y = groundAt(rec.pos.x, rec.pos.z, 1) + Math.abs(Math.sin(t * 16 + rec.h)) * 0.01 * FIG_SCALE;
         rec.quat.setFromAxisAngle(UP_AXIS, w.yaw);
       }
     } else if (w.mode === 'dig') {
       w.t -= dt;
       if (w.t <= 0) {
-        const hp = nearestHeap(rec.pos.x, rec.pos.z);
-        rec.pos.set(hp.x + (Math.random() - 0.5) * 0.4, 0, hp.z + (Math.random() - 0.5) * 0.4);
-        rec.pos.y = heapHeightAt(rec.pos.x, rec.pos.z);
+        nifflerPopOut(rec);
         w.mode = 'sniff';
         w.t = 2 + Math.random() * 2;
         KIT.setMode(rec.h, FIG_MODE.LOOSE);
@@ -10856,7 +11616,7 @@ function updateWaterBomb(dt, t) {
     rec.pos.set(ax + 0.6, 2.0 + Math.sin(t * 2.2) * 0.08, az + 0.3);
     tv1.subVectors(camera.position, rec.pos);
     rec.quat.setFromAxisAngle(UP_AXIS, Math.atan2(tv1.x, tv1.z));
-    KIT.setPose(h, rec.pos, rec.quat, 6 * Math.max(0.01, appear));
+    KIT.setPose(h, rec.pos, rec.quat, (6 / FIG_SCALE) * Math.max(0.01, appear));
     KIT.setMode(h, appear > 0.01 ? FIG_MODE.LOOSE : FIG_MODE.HIDDEN);
   }
   if (BOMB.t > 1.4 && !BOMB.thrown) {
@@ -10888,6 +11648,15 @@ function splashHeap() {
   puff(BOMB.x, 0.3, BOMB.z, 0.9, [0.5, 0.75, 1.0], 24);
   if (BOMB.heap < 0) return;
   const list = REC.filter((r) => r.state === ST.LOOSE && r.heap === BOMB.heap);
+  // The whole pile flies apart: drop its links at once instead of settling it figurine by figurine.
+  const hp = WORLD.heaps[BOMB.heap];
+  if (hp.pile) hp.pile.length = 0;
+  for (const rec of list) {
+    rec.heap = -1;
+    rec.under = [];
+    rec.over = [];
+    KIT.setBaseVisible(rec.h, true);
+  }
   let simulated = 0;
   for (const rec of list) {
     const a = Math.random() * Math.PI * 2;
@@ -10908,8 +11677,9 @@ function splashHeap() {
         x = BOMB.x + Math.cos(a) * 0.5;
         z = BOMB.z + Math.sin(a) * 0.5;
       }
-      poseRandom(rec, x, groundAt(x, z, 0.3), z, Math.random, 0.3, 0.6);
-      rec.heap = -1;
+      const onHeap = heapAt(x, z, 0.98);
+      if (onHeap) joinPile(rec, onHeap, x, z);
+      else poseRandom(rec, x, groundAt(x, z, 0.3), z, Math.random, 0.3, 0.6);
       syncRec(rec);
       hashUpdate(rec);
     }
@@ -10936,7 +11706,7 @@ function elfShelveOne() {
   const cands = [];
   for (const rec of REC) {
     if (rec.state !== ST.LOOSE || rec.actor || rec.wild || !rec.counted) continue;
-    if (rec.pos.z < HALL.minZ) continue;
+    if (rec.pos.z < HALL.minZ || isCovered(rec)) continue;
     const slot = slotFor(rec);
     if (!slot || slot.id === 'honor' || freePosition(slot) < 0) continue;
     cands.push(rec);
@@ -10948,7 +11718,6 @@ function elfShelveOne() {
   puff(rec.pickC.x, rec.pickC.y, rec.pickC.z, 0.25, [1.0, 0.9, 0.65], 10);
   sfx('pop');
   rec.spot = false;
-  rec.heap = -1;
   slot.occupants[posIdx] = rec.h;
   const p = slot.positions[posIdx];
   startScript(rec, p.x, p.y, p.z, slot.yaws[posIdx], 1.4, 'elf', { slot, posIdx });
@@ -11136,7 +11905,8 @@ function castInvito(lvl) {
       if (rec.pickC.distanceTo(eye) > cfg.range) continue;
       list.push(rec);
     }
-    list.sort((a, b) => a.pickC.distanceToSquared(eye) - b.pickC.distanceToSquared(eye));
+    // Uncovered figurines first (pulling one out from under others makes those settle down).
+    list.sort((a, b) => a.pickC.distanceToSquared(eye) + (isCovered(a) ? 100 : 0) - b.pickC.distanceToSquared(eye) - (isCovered(b) ? 100 : 0));
     list.length = Math.min(list.length, cfg.n);
   }
   for (const e of extra) if (e !== 'snitch' && !list.includes(e)) list.push(e);
@@ -11170,7 +11940,7 @@ function updateInvito(dt) {
     rec.spot = false;
     toast(fmt(TXT.toastHidden, { name: rec.d.nameHu }), 'gold');
   }
-  rec.heap = -1;
+  leavePile(rec);
   const feet = vec3(PLAYER.pos.x - Math.sin(PLAYER.yaw) * 0.5, 0, PLAYER.pos.z - Math.cos(PLAYER.yaw) * 0.5);
   tv1.set(STACK_VIEW.x, STACK_VIEW.y, STACK_VIEW.z).applyMatrix4(camera.matrixWorld);
   startScript(rec, tv1.x, tv1.y, tv1.z, PLAYER.yaw, 1.2, 'stack', { feet });
@@ -11516,13 +12286,17 @@ function settleClone(i, instant) {
     x = clampTo(MOULD.x - 0.6 + Math.cos(a) * r * 1.3, SHOP_WORKSHOP.minX + 0.15, SHOP_WORKSHOP.maxX - 0.15);
     z = clampTo(MOULD.z + 1.0 + Math.sin(a) * r, SHOP_WORKSHOP.minZ + 0.15, -5.2);
   }
-  const y = 0.02 + Math.random() * 0.12;
+  const lying = Math.random() < 0.6;
+  const id = CASTING.designId;
+  // A clone on its side rests on its radius (the pose origin is the base centre), so it does not sink into the floor.
+  const lift = lying && FIG_BY_ID[id] ? getFigureMetrics(id).radius * CASTING.scale * 0.92 : 0;
+  const y = 0.02 + Math.random() * 0.12 * FIG_SCALE + lift;
   p[i * 3] = x;
   p[i * 3 + 1] = y;
   p[i * 3 + 2] = z;
   const q = CASTING.quat[i];
   tq1.setFromAxisAngle(UP_AXIS, Math.random() * Math.PI * 2);
-  if (Math.random() < 0.6) q.multiplyQuaternions(tq1, tq2.setFromAxisAngle(X_AXIS, Math.PI / 2));
+  if (lying) q.multiplyQuaternions(tq1, tq2.setFromAxisAngle(X_AXIS, Math.PI / 2));
   else q.copy(tq1);
   CASTING.state[i] = 2;
 }
@@ -11620,6 +12394,19 @@ function resolvePlayer(p) {
   for (let pass = 0; pass < 2; pass++) {
     for (let i = 0; i < WORLD.colliders.length; i++) {
       const o = WORLD.colliders[i];
+      if (o.type === 'ellipse') {
+        // Offset ellipse (radii grown by the player radius): push out along the scaled direction.
+        const ex = o.rx + R;
+        const ez = o.rz + R;
+        const nx = (p.x - o.x) / ex;
+        const nz = (p.z - o.z) / ez;
+        const d = Math.hypot(nx, nz);
+        if (d >= 1) continue;
+        const k = d > 1e-4 ? 1 / d : 1;
+        p.x = o.x + (d > 1e-4 ? nx : 1) * k * ex;
+        p.z = o.z + (d > 1e-4 ? nz : 0) * k * ez;
+        continue;
+      }
       if (o.type === 'circle') {
         const dx = p.x - o.x;
         const dz = p.z - o.z;
@@ -11661,10 +12448,36 @@ function moveSpeeds() {
   return { walk: v[0], run: v[1] };
 }
 
+/* ------------------------------------------------------------------------------------------------
+   Hold-to-zoom (binocular): Z, the middle mouse button or the right stick held in narrows the view smoothly
+   ------------------------------------------------------------------------------------------------ */
+const ZOOM = { k: 0 };
+
+function updateZoom(dt, allow) {
+  const want = allow && IN.held.zoom;
+  const was = ZOOM.k > 0;
+  ZOOM.k = clamp01(ZOOM.k + ((want ? 1 : -1) * dt) / ZOOM_TUNE.easeS);
+  if (was !== ZOOM.k > 0) UI_DIRTY.prompts = true;
+  if (want && !GAME.tipsShown.has('tipZoom')) GAME.tipsShown.add('tipZoom');
+  else if (allow && GAME.playS > 45) tipOnce('tipZoom');
+}
+
+/** Current vertical field of view: the setting, narrowed towards the zoom angle while zooming. */
+function viewFov() {
+  return ZOOM.k > 0 ? lerp(SETTINGS.fov, SETTINGS.zoomFov, easeInOut(ZOOM.k)) : SETTINGS.fov;
+}
+
+/** Look speed factor while zoomed: follows the narrower view, so the aim stays as precise as without zoom. */
+function zoomLookK() {
+  if (ZOOM.k <= 0) return 1;
+  return Math.tan((viewFov() * DEG) / 2) / Math.tan((SETTINGS.fov * DEG) / 2);
+}
+
 /** Applies look input with gamepad look friction and gentle magnetism towards the current target. */
 function applyLook(dt) {
-  let lx = IN.look.x;
-  let ly = IN.look.y;
+  const zk = zoomLookK();
+  let lx = IN.look.x * zk;
+  let ly = IN.look.y * zk;
   if (IN.device === 'pad' && (lx !== 0 || ly !== 0)) {
     const a = ASSIST[SETTINGS.assist] || ASSIST[1];
     const target = AIM.fig ? AIM.fig.pickC : AIM.slot ? AIM.slot.center : null;
@@ -11691,6 +12504,7 @@ function applyLook(dt) {
 }
 
 function updatePlayer(dt, allowMove) {
+  updateZoom(dt, allowMove);
   if (allowMove) applyLook(dt);
   const sp = moveSpeeds();
   if (allowMove && IN.pressed.runToggle) PLAYER.run = !PLAYER.run;
@@ -11727,9 +12541,12 @@ function applyCamera() {
   camera.position.set(PLAYER.pos.x, EYE_H + PLAYER.lift + bob, PLAYER.pos.z);
   te1.set(PLAYER.pitch, PLAYER.yaw, 0, 'YXZ');
   camera.quaternion.setFromEuler(te1);
-  if (camera.fov !== SETTINGS.fov) {
-    camera.fov = SETTINGS.fov;
+  const fov = viewFov();
+  if (camera.fov !== fov) {
+    camera.fov = fov;
     camera.updateProjectionMatrix();
+    // Magnified figures keep their detail: the LOD distances grow with the zoom.
+    if (kit && kit.setLodZoom) kit.setLodZoom(1 / zoomLookK());
   }
   camera.updateMatrixWorld();
 }
@@ -11887,7 +12704,8 @@ function updateAim() {
       const list = HASH.cells[ix + iz * HASH.nx];
       for (let k = 0; k < list.length; k++) {
         const rec = list[k];
-        if (rec.actor) continue;
+        // Only the top of a pile can be grabbed: figurines under others are not targets.
+        if (rec.actor || (rec.heap >= 0 && rec.over && rec.over.length)) continue;
         const { a, dist } = angleTo(eye, dir, rec.pickC, rec.pickR);
         if (dist > reach + rec.pickR) continue;
         const mult = rec.state === ST.WILD ? 1.5 : 1;
@@ -11953,6 +12771,46 @@ function updateAim() {
 }
 
 /* ------------------------------------------------------------------------------------------------
+   Aim highlight: the targeted figurine pops up a little and gets a glowing rim, so it is obvious what will be picked
+   up; the previous target settles back smoothly. Purely visual (rec.pos, the pick sphere and saves are untouched).
+   ------------------------------------------------------------------------------------------------ */
+const HILITE_LIST = [];
+
+function hiliteable(rec) {
+  return rec.state === ST.LOOSE || rec.state === ST.SHELF_OK || rec.state === ST.SHELF_WRONG || rec.state === ST.WILD;
+}
+
+/** Runs after every other pose update of the frame (it re-poses the highlighted figurines with their lift). */
+function updateHighlight(dt, t) {
+  const target = GAME.phase === 'play' && !MENU.open && AIM.fig && !AIM.fig.actor && hiliteable(AIM.fig) ? AIM.fig : null;
+  if (target && !HILITE_LIST.includes(target)) {
+    target.hiT = target.hiT || 0;
+    HILITE_LIST.push(target);
+  }
+  for (let i = HILITE_LIST.length - 1; i >= 0; i--) {
+    const rec = HILITE_LIST[i];
+    const on = rec === target;
+    rec.hiT = on ? Math.min(1, rec.hiT + dt / HILITE.inS) : Math.max(0, rec.hiT - dt / HILITE.outS);
+    const still = hiliteable(rec);
+    // A pop with a small overshoot on the way up, a plain ease on the way down.
+    const k = on ? easeOutBack(rec.hiT) : easeInOut(rec.hiT);
+    if (still) {
+      rec.hiLift = rec.state === ST.WILD ? 0 : (rec.slot ? HILITE.liftShelf : HILITE.lift) * k;
+      tv1.copy(rec.pos);
+      tv1.y += rec.hiLift;
+      KIT.setPose(rec.h, tv1, rec.quat, rec.scale);
+    } else rec.hiLift = 0;
+    const pulse = on ? 0.84 + 0.16 * Math.sin(t * 6.5) : 1;
+    if (rec.hiT <= 0) {
+      if (still) KIT.setPose(rec.h, rec.pos, rec.quat, rec.scale);
+      rec.hiLift = 0;
+      KIT.setRim(rec.h, 0);
+      HILITE_LIST.splice(i, 1);
+    } else KIT.setRim(rec.h, Math.max(0.002, clamp01(k) * pulse));
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------
    Aim ring (world feedback at the target) and the throw arc preview
    ------------------------------------------------------------------------------------------------ */
 const AIMFX = { ring: null, arc: null, arcPos: null, holdT: 0 };
@@ -11992,9 +12850,11 @@ function updateAimFx(t, dt) {
     } else if (AIM.fig) {
       const r = AIM.fig;
       ring.position.set(r.lying ? r.pickC.x : r.pos.x, r.groundY + 0.006, r.lying ? r.pickC.z : r.pos.z);
-      ring.scale.setScalar(Math.max(0.035, (r.met.baseR || r.met.radius) * r.scale) * 1.35);
+      ring.scale.setScalar(Math.max(0.035 * FIG_SCALE, (r.met.baseR || r.met.radius) * r.scale) * 1.35);
       ring.material.color.setHex(0xffc860);
-      show = r.state !== ST.WILD;
+      // In a pile the outline and the pop-up mark the target; a floor ring would hang between the figurines.
+      const inPile = r.heap >= 0 && r.state === ST.LOOSE && !WORLD.heaps[r.heap].crate;
+      show = r.state !== ST.WILD && !inPile;
     }
   }
   ring.visible = show;
@@ -12494,7 +13354,7 @@ const PAD_GLYPH = {
   run: '<span class="pad stick">L</span>', flourish: '<span class="pad stick">R</span>', confirm: '<span class="pad a">A</span>',
   back: '<span class="pad b">B</span>', tabs: '<span class="glyphs"><span class="pad bump">LB</span><span class="pad bump">RB</span></span>',
   adjust: `<span class="pad dpad">${DPAD_SVG(DPAD_ON.left + DPAD_ON.right)}</span>`, catch: '<span class="pad trig">RT</span>',
-  move: '<span class="pad stick">L</span>', look: '<span class="pad stick">R</span>',
+  move: '<span class="pad stick">L</span>', look: '<span class="pad stick">R</span>', zoom: '<span class="pad stick hold">R</span>',
 };
 const KEY_GLYPH = {
   pick: `<span class="key">${MOUSE_SVG('L')}</span>`, place: `<span class="key">${MOUSE_SVG('R')}</span>`, throw: '<span class="key">F</span>',
@@ -12504,6 +13364,7 @@ const KEY_GLYPH = {
   confirm: '<span class="key">Enter</span>', back: '<span class="key">Esc</span>', tabs: '<span class="glyphs"><span class="key">←</span><span class="key">→</span></span>',
   adjust: '<span class="glyphs"><span class="key">←</span><span class="key">→</span></span>', catch: `<span class="key">${MOUSE_SVG('L')}</span>`,
   move: '<span class="glyphs"><span class="key">W</span><span class="key">A</span><span class="key">S</span><span class="key">D</span></span>', look: `<span class="key">${MOUSE_SVG('')}</span>`,
+  zoom: '<span class="key">Z</span>',
 };
 
 function glyph(action, device = IN.device) {
@@ -12582,6 +13443,10 @@ function initHud() {
     return { wrap, medal, state, glyph: medal.querySelector('.btn-glyph'), key: k, last: -1, lastP: -1 };
   });
   for (let i = 0; i < 10; i++) UI.ttPips.append(el('i'));
+  // The hover card is docked against measured HUD panels: re-dock it when the window changes size.
+  window.addEventListener('resize', () => {
+    if (UI.card.classList.contains('show')) layoutHoverCard();
+  });
 }
 
 function setLoad(fraction, text) {
@@ -12685,7 +13550,7 @@ function notice(text, ms = 7000) {
 }
 
 const TIPQ = { list: [], t: 0, current: null, device: '' };
-const TIP_GLYPH = { tipPick: 'pick', tipPlace: 'place', tipRules: 'map', tipCycle: 'cycle', tipThrow: 'throw', tipSpells: 'spell1' };
+const TIP_GLYPH = { tipPick: 'pick', tipPlace: 'place', tipRules: 'map', tipCycle: 'cycle', tipThrow: 'throw', tipSpells: 'spell1', tipZoom: 'zoom' };
 
 function showTip(key) {
   TIPQ.list.push(key);
@@ -12772,6 +13637,35 @@ function setPips(n, m, wrong = 0) {
   for (let i = 0; i < pips.length; i++) {
     pips[i].hidden = i >= m;
     pips[i].className = i < n ? 'on' : i < n + wrong ? 'bad' : '';
+  }
+}
+
+/**
+ * Docks the hover card at the left TV-safe margin, below the galleon / progress panel and above the spell medals
+ * (both measured, so text size and resolution changes are followed); it sits near the old height when there is room.
+ */
+function layoutHoverCard() {
+  const H = window.innerHeight;
+  const vh = H / 100;
+  const gap = 2 * vh;
+  const tl = UI.hud ? UI.hud.querySelector('.tl') : null;
+  const tlBottom = tl ? tl.getBoundingClientRect().bottom : 0;
+  const sp = UI.spells ? UI.spells.getBoundingClientRect() : null;
+  const floor = sp && sp.height > 0 ? sp.top : H * 0.95;
+  const ts = SETTINGS.textSize || 1;
+  const wanted = H * 0.5 - (12 + 10 * (ts - 1)) * vh;
+  // Natural height of the current content: measured once without the height cap (one extra layout per card change).
+  UI.card.style.setProperty('--card-maxh', 'none');
+  const need = UI.card.offsetHeight;
+  const top = Math.max(tlBottom + gap, Math.min(wanted, floor - gap - need));
+  UI.card.style.setProperty('--card-top', `${Math.round(top)}px`);
+  UI.card.style.setProperty('--card-maxh', `${Math.round(Math.max(12 * vh, floor - gap - top))}px`);
+  // When the description has to shrink, show whole lines only (never a line cut in half).
+  const desc = UI.ttDesc;
+  desc.style.maxHeight = '';
+  if (!desc.hidden && desc.scrollHeight > desc.clientHeight + 1) {
+    const lh = parseFloat(getComputedStyle(desc).lineHeight) || 2.8 * vh;
+    desc.style.maxHeight = `${Math.floor((desc.clientHeight + 1) / lh) * lh}px`;
   }
 }
 
@@ -12864,6 +13758,7 @@ function updateHoverCard() {
     UI.ttDesc.textContent = '';
     UI.ttActions.innerHTML = stackTop() ? cardActions([['place', TXT.promptPlace]]) : '';
   }
+  layoutHoverCard();
   card.classList.add('show');
 }
 
@@ -12885,6 +13780,8 @@ function updatePrompts() {
     }
     if ((AIM.fig || AIM.card >= 0 || AIM.snitch) && list.length < 4) list.unshift(['pick', AIM.snitch || (AIM.fig && AIM.fig.state === ST.WILD) ? TXT.promptCatch : TXT.promptPick]);
     if (!top && !AIM.fig && !AIM.inter && list.length < 4) list.push(['map', TXT.promptMap]);
+    // Hold-to-zoom: shown while zooming and whenever nothing is aimed at (the hint bar has room then).
+    if ((ZOOM.k > 0 || (!AIM.fig && !AIM.slot && !AIM.inter && AIM.card < 0 && !AIM.snitch)) && list.length < 4) list.push(['zoom', TXT.promptZoom]);
   }
   const html = list.slice(0, 4).map(([a, l]) => `<span>${glyph(a)}${escapeHtml(l)}</span>`).join('');
   const k = `${html}|${IN.device}`;
@@ -13381,10 +14278,11 @@ function mapSvg() {
     const cx = (b.minX + b.maxX) / 2;
     const cz = (b.minZ + b.maxZ) / 2;
     const tx = u.yaw === 0 ? cx : u.yaw > 0 ? b.maxX + 0.25 : b.minX - 0.25;
-    const tz = u.yaw === 0 ? b.maxZ + 0.5 : cz;
-    const anchor = u.yaw === 0 ? 'middle' : u.yaw > 0 ? 'start' : 'end';
-    // Side-wall units have room for larger labels; the four house units along the back wall sit side by side.
-    const fs = u.yaw === 0 ? 0.36 : 0.42;
+    // Back-wall labels sit above the hall outline (the side-wall labels run along the walls below them).
+    const back = u.yaw === 0;
+    const fs = back ? 0.36 : 0.42;
+    const tz = back ? b.minZ - 0.2 - fs * 1.2 : cz;
+    const anchor = back ? 'middle' : u.yaw > 0 ? 'start' : 'end';
     add('text', { x: tx, y: tz, 'font-size': fs, fill: '#f1e8d6', 'text-anchor': anchor, 'font-weight': 600, class: 'lbl' }, cat.nameHu);
     add('text', { x: tx, y: tz + fs * 1.2, 'font-size': fs * 0.9, fill: done ? '#f2dca2' : '#d8ccb0', 'text-anchor': anchor, class: 'lbl' }, done ? `${n}/${m} · ${TXT.mapDone}` : `${n}/${m}`);
     if (SYMBOL_URL[key]) add('image', { href: SYMBOL_URL[key], x: cx - 0.25, y: cz - 0.25, width: 0.5, height: 0.5 });
@@ -13393,14 +14291,14 @@ function mapSvg() {
   for (const r of REC) if ((r.state === ST.LOOSE || r.state === ST.WILD) && r.heap >= 0) counts[r.heap]++;
   WORLD.heaps.forEach((hp, i) => {
     if (hp.crate) add('rect', { x: hp.box.minX, y: hp.box.minZ, width: hp.box.maxX - hp.box.minX, height: hp.box.maxZ - hp.box.minZ, fill: 'rgba(120,80,40,0.7)', stroke: '#c9a35c', 'stroke-width': 0.04 });
-    else add('circle', { cx: hp.x, cy: hp.z, r: hp.r, fill: 'rgba(200,170,110,0.25)', stroke: '#c9a35c', 'stroke-width': 0.05, 'stroke-dasharray': '0.15 0.1' });
+    else add('ellipse', { cx: hp.x, cy: hp.z, rx: hp.rx, ry: hp.rz, fill: 'rgba(200,170,110,0.25)', stroke: '#c9a35c', 'stroke-width': 0.05, 'stroke-dasharray': '0.15 0.1' });
   });
   // Heap counts are drawn last (below) as small opaque badges, so a shelf label running across a heap circle can
   // never hide its number.
   const badges = WORLD.heaps.map((hp, i) => {
     // Badge in the lower part of the heap circle: the wall shelf labels run through the circle's middle row.
     const bx = hp.x;
-    const bz = hp.crate ? hp.z : hp.z + hp.r * 0.62;
+    const bz = hp.crate ? hp.z : hp.z + hp.rz * 0.62;
     const txt = String(counts[i]);
     const w = 0.3 + 0.24 * txt.length;
     return [['rect', { x: bx - w / 2, y: bz - 0.27, width: w, height: 0.54, rx: 0.12, fill: 'rgba(42,28,16,0.92)', stroke: '#c9a35c', 'stroke-width': 0.04 }],
@@ -13675,9 +14573,9 @@ MENU_BUILDERS.controls = () => {
   panel.style.width = 'min(150vh, 100%)';
   panel.append(el('h2', 'engraved', TXT.ctlTitle));
   const C = TXT.ctl;
-  const pad = [['move', C.walk], ['look', C.look], ['pick', C.pick], ['place', C.place], ['throw', C.throw], ['cycle', C.cycle], ['interact', C.use],
+  const pad = [['move', C.walk], ['look', C.look], ['zoom', C.zoom], ['pick', C.pick], ['place', C.place], ['throw', C.throw], ['cycle', C.cycle], ['interact', C.use],
     ['drop', C.drop], ['map', C.map], ['info', C.info], ['spells', C.spells], ['missing', C.missing], ['pause', C.pause]];
-  const kbm = [['move', C.walk.split(' (')[0]], ['run', C.run], ['look', C.mouse], ['arrows', C.arrows], ['pick', C.pick], ['place', C.place], ['throw', C.throw],
+  const kbm = [['move', C.walk.split(' (')[0]], ['run', C.run], ['look', C.mouse], ['zoomKbm', C.zoom], ['arrows', C.arrows], ['pick', C.pick], ['place', C.place], ['throw', C.throw],
     ['cycle', C.cycle], ['interact', C.use], ['drop', C.drop], ['map', C.map], ['info', C.info], ['spells', C.spells], ['missing', C.missing], ['flourish', C.flourish], ['pause', C.pause]];
   const col = (title, rows, dev) => {
     const c = el('div');
@@ -13688,6 +14586,7 @@ MENU_BUILDERS.controls = () => {
       let g = '';
       if (a === 'spells') g = `${glyph('spell1', dev)}${glyph('spell2', dev)}${glyph('spell3', dev)}`;
       else if (a === 'arrows') g = '<span class="key">←</span><span class="key">↑</span><span class="key">↓</span><span class="key">→</span>';
+      else if (a === 'zoomKbm') g = `${glyph('zoom', dev)}<span class="key">${MOUSE_SVG('M')}</span>`;
       else g = glyph(a, dev);
       row.innerHTML = `<span>${g}</span><span>${escapeHtml(label)}</span>`;
       r.append(row);
@@ -13718,6 +14617,7 @@ const SETTING_ROWS = [
   { key: 'deadL', label: 'setDeadL', type: 'range', min: 0.05, max: 0.24, step: 0.01, show: (v) => fmtDec(v, 2) },
   { key: 'deadR', label: 'setDeadR', type: 'range', min: 0.05, max: 0.24, step: 0.01, show: (v) => fmtDec(v, 2) },
   { key: 'assist', label: 'setAssist', type: 'choice', values: [0, 1, 2], names: () => TXT.setAssistValues },
+  { key: 'zoomFov', label: 'setZoom', type: 'range', min: 20, max: 40, step: 2, show: (v) => `${Math.round(v)}°` },
   { key: 'rumble', label: 'setRumble', type: 'toggle' },
   { sec: 'setSecVideo' },
   { key: 'quality', label: 'setQuality', type: 'choice', values: ['xbox', 'magas'], names: () => TXT.setQualityValues },
@@ -13856,7 +14756,7 @@ const PRESS_NAMES = ['pick', 'place', 'throwStart', 'throwRelease', 'cycle', 'dr
 
 const IN = {
   device: 'kbm', move: { x: 0, y: 0 }, look: { x: 0, y: 0 },
-  held: { pick: false, place: false, throw: false, run: false },
+  held: { pick: false, place: false, throw: false, run: false, zoom: false },
   pressed: Object.fromEntries(PRESS_NAMES.map((n) => [n, false])),
   padConnected: false, padId: '', padMapping: '', browsingSuspect: false, locked: false, lockFailed: false,
   consume(name) {
@@ -13869,10 +14769,13 @@ const IN = {
 
 const KEYS = new Set();
 const PENDING = new Set();
-const MOUSE = { dx: 0, dy: 0, down: false, button: -1, id: -1, lastX: 0, lastY: 0, moved: 0, leftHeld: false, rightHeld: false, wantPause: false, gameUnlock: false };
+const MOUSE = {
+  dx: 0, dy: 0, down: false, button: -1, id: -1, lastX: 0, lastY: 0, moved: 0, leftHeld: false, rightHeld: false, wantPause: false, gameUnlock: false,
+  buttons: 0, midHeld: false, midDownAt: 0,
+};
 const PAD = {
   index: -1, prev: new Uint8Array(17), cur: new Uint8Array(17), seen: new Map(), trig: [false, false], menuDownAt: -1, warned: false,
-  rampT: 0, ramp: 1, lastSig: new Map(), appearAt: new Map(), lost: false,
+  rampT: 0, ramp: 1, lastSig: new Map(), appearAt: new Map(), lost: false, rsDownAt: -1, rsZoom: false,
 };
 const NAV = { dir: '', t: 0 };
 const BROWSE = { dpad: [], matches: 0, lastDpadT: -1, padBackT: -1e9, popBackT: -1e9 };
@@ -13881,11 +14784,15 @@ const GHOST_ARROWS = new Set();
 const DPAD_ARROWS = [[12, 'up', 'ArrowUp'], [13, 'down', 'ArrowDown'], [14, 'left', 'ArrowLeft'], [15, 'right', 'ArrowRight']];
 const PAD_PRESS_MAP = [
   [7, 'pick'], [6, 'place'], [4, 'cycle'], [4, 'tabPrev'], [5, 'tabNext'], [0, 'interact'], [0, 'confirm'], [1, 'drop'], [1, 'back'], [2, 'map'], [3, 'info'],
-  [14, 'spell1'], [12, 'spell2'], [15, 'spell3'], [13, 'missing'], [10, 'runToggle'], [11, 'flourish'],
+  [14, 'spell1'], [12, 'spell2'], [15, 'spell3'], [13, 'missing'], [10, 'runToggle'],
 ];
+// The right stick click [11] is handled separately: a tap is the flourish (on release), holding it in zooms.
 const STICK = { l: { x: 0, y: 0 }, r: { x: 0, y: 0 } };
+/** Zoom keys: Z by its position on a US layout and on the Hungarian QWERTZ layout (where the Z key sends KeyY). */
+const ZOOM_KEYS = ['KeyZ', 'KeyY'];
 const GAME_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Backspace', 'PageUp', 'PageDown', 'Tab', 'KeyW', 'KeyA', 'KeyS', 'KeyD',
-  'KeyE', 'KeyF', 'KeyG', 'KeyQ', 'KeyR', 'KeyH', 'KeyI', 'KeyM', 'KeyP', 'Digit1', 'Digit2', 'Digit3', 'Enter', 'Escape', 'ShiftLeft', 'ShiftRight']);
+  'KeyE', 'KeyF', 'KeyG', 'KeyQ', 'KeyR', 'KeyH', 'KeyI', 'KeyM', 'KeyP', 'Digit1', 'Digit2', 'Digit3', 'Enter', 'Escape', 'ShiftLeft', 'ShiftRight',
+  ...ZOOM_KEYS]);
 let inputNow = 0;
 
 function isTyping(e) {
@@ -13970,6 +14877,40 @@ function onKeyUp(e) {
   }
 }
 
+/** Bit of a mouse button in `MouseEvent.buttons` (left 1, right 2, middle 4). */
+function buttonBit(button) {
+  return button === 0 ? 1 : button === 2 ? 2 : button === 1 ? 4 : 0;
+}
+
+/**
+ * Applies the pointer-locked mouse button state (bit mask): left picks, right places, the middle button zooms while
+ * held and is the flourish when only clicked. Handles chorded presses too.
+ */
+function lockedButtons(b) {
+  const down = b & ~MOUSE.buttons;
+  const up = MOUSE.buttons & ~b;
+  MOUSE.buttons = b;
+  const now = inputNow;
+  if (down & 1) {
+    PENDING.add('pick');
+    MOUSE.leftHeld = true;
+  }
+  if (down & 2) {
+    PENDING.add('place');
+    MOUSE.rightHeld = true;
+  }
+  if (down & 4) {
+    MOUSE.midHeld = true;
+    MOUSE.midDownAt = now;
+  }
+  if (up & 1) MOUSE.leftHeld = false;
+  if (up & 2) MOUSE.rightHeld = false;
+  if (up & 4) {
+    if (MOUSE.midHeld && now - MOUSE.midDownAt < ZOOM_TUNE.holdS) PENDING.add('flourish');
+    MOUSE.midHeld = false;
+  }
+}
+
 function requestLock() {
   const c = byId('scene');
   if (IN.lockFailed || !c.requestPointerLock) return;
@@ -14006,6 +14947,8 @@ function wireInput() {
     KEYS.clear();
     MOUSE.leftHeld = false;
     MOUSE.rightHeld = false;
+    MOUSE.midHeld = false;
+    MOUSE.buttons = 0;
     if (GAME.phase === 'play') PENDING.add('pause');
   });
   const c = byId('scene');
@@ -14021,20 +14964,21 @@ function wireInput() {
     MOUSE.lastY = e.clientY;
     MOUSE.moved = 0;
     try { c.setPointerCapture(e.pointerId); } catch { /* optional */ }
-    if (IN.locked) {
-      if (e.button === 0) {
-        PENDING.add('pick');
-        MOUSE.leftHeld = true;
-      } else if (e.button === 2) {
-        PENDING.add('place');
-        MOUSE.rightHeld = true;
-      } else if (e.button === 1) PENDING.add('flourish');
-    } else if (IN.lockFailed || e.pointerType !== 'mouse') c.classList.add('dragging');
+    if (e.button === 1) e.preventDefault();
+    if (IN.locked) lockedButtons(MOUSE.buttons | buttonBit(e.button));
+    else if (IN.lockFailed || e.pointerType !== 'mouse') c.classList.add('dragging');
   });
+  // No middle-click autoscroll or paste: the middle button is the zoom / flourish button.
+  c.addEventListener('mousedown', (e) => {
+    if (e.button === 1) e.preventDefault();
+  });
+  c.addEventListener('auxclick', (e) => e.preventDefault());
   c.addEventListener('pointermove', (e) => {
     if (IN.locked) {
       MOUSE.dx += e.movementX || 0;
       MOUSE.dy += e.movementY || 0;
+      // Chorded presses (a second button while one is held) arrive only as a change of `buttons`.
+      if (e.pointerType === 'mouse' && e.buttons !== MOUSE.buttons) lockedButtons(e.buttons & 7);
       return;
     }
     if (!MOUSE.down || e.pointerId !== MOUSE.id) return;
@@ -14052,6 +14996,7 @@ function wireInput() {
     if (e.pointerId !== MOUSE.id) return;
     MOUSE.down = false;
     c.classList.remove('dragging');
+    if (IN.locked) lockedButtons(e.type === 'pointerup' ? MOUSE.buttons & ~buttonBit(e.button) : 0);
     if (MOUSE.leftHeld && e.button === 0) MOUSE.leftHeld = false;
     if (MOUSE.rightHeld && e.button === 2) MOUSE.rightHeld = false;
     if (e.type !== 'pointerup' || IN.locked) return;
@@ -14072,6 +15017,8 @@ function wireInput() {
   document.addEventListener('pointerlockchange', () => {
     IN.locked = document.pointerLockElement === c;
     c.classList.toggle('locked', IN.locked);
+    MOUSE.buttons = 0;
+    MOUSE.midHeld = false;
     if (!IN.locked) {
       if (!MOUSE.gameUnlock && GAME.phase === 'play' && !MENU.open) PENDING.add('pause');
       MOUSE.gameUnlock = false;
@@ -14197,6 +15144,18 @@ function pollGamepad(dt) {
   }
   if (edge(5) === 1) PENDING.add('throwStart');
   if (edge(5) === -1) PENDING.add('throwRelease');
+  // Right stick click: a tap is the flourish (fired on release), holding it in zooms like binoculars.
+  const rs = edge(11);
+  if (rs === 1) {
+    PAD.rsDownAt = inputNow;
+    PAD.rsZoom = false;
+  }
+  if (cur[11] && PAD.rsDownAt >= 0 && inputNow - PAD.rsDownAt >= ZOOM_TUNE.holdS) PAD.rsZoom = true;
+  if (rs === -1 || (!cur[11] && PAD.rsDownAt >= 0)) {
+    if (PAD.rsDownAt >= 0 && !PAD.rsZoom) PENDING.add('flourish');
+    PAD.rsDownAt = -1;
+    PAD.rsZoom = false;
+  }
   // Menu: a tap pauses (a long press is Edge's own mode switch and must never be required).
   const me = edge(9);
   if (me === 1) PAD.menuDownAt = now;
@@ -14220,6 +15179,7 @@ function pollGamepad(dt) {
   IN.held.pick = IN.held.pick || !!cur[7];
   IN.held.place = IN.held.place || !!cur[6];
   IN.held.throw = IN.held.throw || !!cur[5];
+  IN.held.zoom = IN.held.zoom || PAD.rsZoom;
   PAD.prev.set(cur);
 }
 
@@ -14244,6 +15204,7 @@ function pollInput(dt) {
   IN.held.pick = MOUSE.leftHeld;
   IN.held.place = MOUSE.rightHeld;
   IN.held.throw = KEYS.has('KeyF');
+  IN.held.zoom = KEYS.has(ZOOM_KEYS[0]) || KEYS.has(ZOOM_KEYS[1]) || (MOUSE.midHeld && inputNow - MOUSE.midDownAt >= ZOOM_TUNE.holdS);
   pollGamepad(dt);
   for (const n of PENDING) IN.pressed[n] = true;
   PENDING.clear();
@@ -14331,7 +15292,7 @@ function doFullscreenToggle() {
 /* ==== 80-save.js — settings (device-local), local save with two rotating slots and a checksum, hot snapshot ==== */
 
 const SETTINGS_DEFAULT = {
-  sensitivity: 1, invertY: false, deadL: 0.15, deadR: 0.12, assist: 1, fov: 70, bob: false, rumble: true,
+  sensitivity: 1, invertY: false, deadL: 0.15, deadR: 0.12, assist: 1, fov: 70, zoomFov: 28, bob: false, rumble: true,
   quality: IS_XBOX || IS_TOUCH ? 'xbox' : 'magas', textSize: 1, contrast: false, music: 0.5, sfx: 0.8, ambient: true,
   bombs: true, wild: true, perf: false, details: true,
 };
@@ -14371,6 +15332,8 @@ function applySettings() {
   if (UI.perf) UI.perf.hidden = !SETTINGS.perf;
   applyVolumes();
   UI_DIRTY.card = true;
+  // Text size moves the HUD panels the hover card is docked between: rebuild (and re-dock) it.
+  CARD_STATE.key = '';
 }
 
 function onSettingChanged(key) {
@@ -14454,6 +15417,7 @@ function makeSaveData() {
     flags: { ...GAME.flags }, stats: { ...GAME.stats }, ach: GAME.ach.slice(),
     cam: { x: Math.round(PLAYER.pos.x * 100) / 100, z: Math.round(PLAYER.pos.z * 100) / 100, yaw: Math.round(PLAYER.yaw * 1000) / 1000, pitch: Math.round(PLAYER.pitch * 1000) / 1000 },
     name: GAME.name, tips: [...GAME.tipsShown], sortedCount: GAME.sorted, elvesT: Math.round(ELVES.t), music: AUDIO.musicMode,
+    layout: LAYOUT_VERSION,
   };
 }
 
@@ -14607,6 +15571,10 @@ function applySaveData(d) {
   ELVES.t = +d.elvesT || 0;
   if (Number.isFinite(d.music)) AUDIO.musicMode = clampTo(d.music | 0, 0, 2);
   // Figurines: shelved ones first (slots), then loose and wild poses, then the stack in order.
+  // A save from an older layout (smaller figurines, other heaps) keeps its shelves, stack and progress; its heap
+  // figurines, hidden legendary copies and runaways stay where spawnAll() just put them in the new heaps, and
+  // figurines the player left elsewhere stand upright at their old floor spot.
+  const oldLayout = !(d.layout >= LAYOUT_VERSION);
   const held = [];
   for (const rec of REC) {
     if (rec.actor) continue;
@@ -14628,6 +15596,30 @@ function applySaveData(d) {
       if (rec.id === 'shopkeeper' || (rec.wild && rec.wild.kind === 'flyer')) continue;
       rec.state = -1;
       setState(rec, ST.HIDDEN);
+    } else if (e.length >= 11 && oldLayout) {
+      const inHeap = Number.isFinite(e[12]) && e[12] >= 0;
+      if (s === STATE_CODE.wild || e[11]) continue;
+      if (inHeap) {
+        if (rec.spot) {
+          // An already found legendary copy that was dropped onto a heap: back onto a heap, not its hiding place.
+          rec.spot = false;
+          rec.pos.set(0, -1, 0);
+          rec.state = ST.LOOSE;
+          recoverLost(true);
+        }
+        continue;
+      }
+      const x = e[4] / 1000;
+      const z = e[6] / 1000;
+      tv1.set(0, 0, 1).applyQuaternion(tq1.set(e[7] / 10000, e[8] / 10000, e[9] / 10000, e[10] / 10000).normalize());
+      poseUpright(rec, x, groundAt(x, z, e[5] / 1000 + 0.05), z, Math.atan2(tv1.x, tv1.z));
+      rec.wild = null;
+      rec.spot = false;
+      rec.heap = -1;
+      rec.state = -1;
+      setState(rec, ST.LOOSE);
+      syncRec(rec);
+      hashUpdate(rec);
     } else if (e.length >= 11) {
       rec.pos.set(e[4] / 1000, e[5] / 1000, e[6] / 1000);
       rec.quat.set(e[7] / 10000, e[8] / 10000, e[9] / 10000, e[10] / 10000).normalize();
@@ -14654,8 +15646,11 @@ function applySaveData(d) {
     rec.wild = null;
     rec.spot = false;
     if (rec.slot) unseat(rec);
+    rec.heap = -1;
     pushStack(rec);
   }
+  // Pile links follow the restored poses (old layouts: figurines that rested on shelved or held ones settle down).
+  rebuildPiles();
   if (GAME.snitch.caught && SNITCH.rec && SNITCH.rec.state === ST.HIDDEN && !held.some(([, r]) => r === SNITCH.rec)) {
     // The caught Snitch was shelved or dropped; nothing else to do.
   }
@@ -15047,6 +16042,12 @@ function updateTitleCamera(dt) {
   camera.position.set(Math.sin(a) * 3.2 + 0.5, 2.65 + Math.sin(a * 1.7) * 0.15, 2.4 + Math.cos(a) * 1.5);
   tm1.lookAt(camera.position, tv1.set(0, 1.9, -2.2), UP_AXIS);
   camera.quaternion.setFromRotationMatrix(tm1);
+  ZOOM.k = 0;
+  if (camera.fov !== SETTINGS.fov) {
+    camera.fov = SETTINGS.fov;
+    camera.updateProjectionMatrix();
+    if (kit && kit.setLodZoom) kit.setLodZoom(1);
+  }
   camera.updateMatrixWorld();
 }
 
@@ -15091,7 +16092,8 @@ function simulate(dt) {
     updateSnitch(dt, t);
   }
   updateShimmer(dt);
-  updateStackView(t);
+  updateStackView(t, dt);
+  updateHighlight(dt, t);
   updateGlints(t);
   updatePuffs(dt);
   updateAimFx(t, dt);
@@ -15204,7 +16206,25 @@ const DEBUG_API = {
       player: { x: PLAYER.pos.x, z: PLAYER.pos.z, yaw: PLAYER.yaw, pitch: PLAYER.pitch }, up: { ...GAME.up }, cd: { ...GAME.cd }, deckPos: GAME.deckPos,
       device: IN.device, pad: IN.padConnected, saved: SAVE.lastSavedAt, saveAvailable: SAVE.available, dirty: GAME.dirty, external: EXTERN.ids.slice(),
       wrong: GAME.stats.wrongPlacements, finale: GAME.flags.finaleDone, clones: CASTING.count,
+      hilite: AIM.fig ? +(AIM.fig.hiT || 0).toFixed(2) : 0, zoom: +ZOOM.k.toFixed(2), fov: +camera.fov.toFixed(1),
+      hand: top && top.hand ? +top.hand.t.toFixed(2) : null,
     };
+  },
+  /** Seats every figurine of a category or design (tests: full slots and shelves without walking). */
+  fillSlots(key) {
+    for (const rec of REC) {
+      if (!rec.counted || (rec.cat !== key && rec.id !== key) || rec.state === ST.HELD || rec.state === ST.SHELF_OK) continue;
+      const slot = slotFor(rec);
+      const pi = slot ? freePosition(slot) : -1;
+      if (pi < 0) continue;
+      if (rec.slot) unseat(rec);
+      rec.wild = null;
+      rec.spot = false;
+      rec.paid = true;
+      seatInSlot(rec, slot, pi);
+    }
+    recount();
+    return this.state();
   },
   info() {
     const i = renderer.info;
@@ -15349,7 +16369,7 @@ const DEBUG_API = {
   },
   /** Live engine objects for automated diagnostics (not used by the game itself). */
   internals() {
-    return { THREE, scene, camera, renderer, kit, composer, GAME, REC, WORLD, SNITCH, SETTINGS, MENU, LOOP, PLATES, slotPlateState };
+    return { THREE, scene, camera, renderer, kit, composer, GAME, REC, WORLD, SNITCH, SETTINGS, MENU, LOOP, PLATES, slotPlateState, leavePile };
   },
   /** Stands about `dist` metres from a world point on free floor and looks at it (Snitch, interactables, spots). */
   aimPoint(x, y, z, dist = 1.1) {
@@ -15374,6 +16394,13 @@ const DEBUG_API = {
     storeSettings();
     applyQuality();
     return SETTINGS.quality;
+  },
+  /** Text size setting (1.0–2.0), as the settings menu applies it. */
+  setTextSize(v) {
+    SETTINGS.textSize = v;
+    storeSettings();
+    applySettings();
+    return SETTINGS.textSize;
   },
   newGame() {
     newGame(true);
