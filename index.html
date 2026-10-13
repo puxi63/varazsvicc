@@ -1012,6 +1012,10 @@ const TXT = {
   toastRegister: 'Ragadós ujjak… +20 galleon. Fred és George ezt nem látta.',
   toastMusic: 'Zene: {name}',
   musicNames: ['Esti dallam', 'Gyertyafény', 'Csend'],
+  musicOwn: 'Saját zenék',
+  musicOwnTrack: 'Saját zene {n}',
+  toastTrack: 'Most szól: {name}',
+  toastOwnFound: 'Megvannak a saját zenéid ({n} db). A zenélő dobozzal válthatsz a dallamok között.',
   toastLumos: 'Lumos – felragyogtak a társai.',
   toastLumosEmpty: 'Lumos – felragyogtak a legközelebbi rendezetlen figurák.',
   toastInvito: 'Invito – jönnek a figurák!',
@@ -1235,7 +1239,7 @@ const TXT = {
     fullscreen: 'A böngésző teljes képernyős módja.',
     textSize: 'A feliratok és menük mérete.',
     contrast: 'Átlátszatlan, erősebb kontrasztú panelek.',
-    music: 'A zenélő doboz dallamainak hangereje.',
+    music: 'A zene hangereje: a zenélő doboz dallamai és a saját zenéid (assets/music mappa).',
     sfx: 'A lerakás, a bűbájok és a figurák hangjai.',
     ambient: 'Halk bolti zajok: pattogás, utcazaj és óraketyegés.',
     bombs: 'Hóborc időnként szétdobál egy kupacot. Kikapcsolva ez nem történik meg.',
@@ -13171,11 +13175,18 @@ function updateAimFx(t, dt) {
 }
 
 /* ---- 55-audio.js ---- */
-/* ==== 55-audio.js — WebAudio synthesis only (no sample files): effects, figurine voices, music box, ambience ==== */
+/* ==== 55-audio.js — WebAudio synthesis (effects, figurine voices, music box, ambience) and the player's own music
+   files (assets/music/zene-N.mp3 / .ogg / .m4a, discovered at run time and played as a crossfading playlist) ==== */
+
+/** Music modes: the two generated tunes, silence, and the player's own tracks (only offered when some were found). */
+const MUSIC_ESTI = 0;
+const MUSIC_GYERTYA = 1;
+const MUSIC_OFF = 2;
+const MUSIC_OWN = 3;
 
 const AUDIO = {
   ctx: null, master: null, music: null, fx: null, amb: null, comp: null, noise: null,
-  musicMode: 0, nextT: 0, step: 0, lastCoin: 0, hinted: false, swell: 0, ambT: 0, bubbleT: 0, clockT: 0, wind: null,
+  musicMode: MUSIC_ESTI, musicPicked: false, nextT: 0, step: 0, lastCoin: 0, hinted: false, swell: 0, ambT: 0, bubbleT: 0, clockT: 0, wind: null,
 };
 
 /** Creates (once) and resumes the context; must run synchronously inside a user-gesture handler. */
@@ -13206,8 +13217,13 @@ function audioUnlock() {
       AUDIO.noise = buf;
       applyVolumes();
       startWind();
+      discoverOwnMusic();
     }
     if (AUDIO.ctx.state === 'suspended') AUDIO.ctx.resume().catch(() => {});
+    if (OWN_MUSIC.needGesture) {
+      OWN_MUSIC.needGesture = false;
+      if (ownMusicActive()) ownMusicPlay(OWN_MUSIC.idx, OWN_MUSIC.fadeIn);
+    }
   } catch (err) {
     console.warn('[audio] unavailable', err);
   }
@@ -13215,6 +13231,7 @@ function audioUnlock() {
 
 function audioSuspend() {
   try {
+    ownMusicPause();
     if (AUDIO.ctx && AUDIO.ctx.state === 'running') AUDIO.ctx.suspend().catch(() => {});
   } catch {
     /* audio is optional */
@@ -13224,6 +13241,7 @@ function audioSuspend() {
 function audioResume() {
   try {
     if (AUDIO.ctx && AUDIO.ctx.state === 'suspended') AUDIO.ctx.resume().catch(() => {});
+    ownMusicResume();
   } catch {
     /* audio is optional */
   }
@@ -13232,7 +13250,10 @@ function audioResume() {
 function applyVolumes() {
   if (!AUDIO.ctx) return;
   const t = AUDIO.ctx.currentTime;
-  AUDIO.music.gain.setTargetAtTime(0.5 * SETTINGS.music * (AUDIO.musicMode === 2 ? 0 : 1) * (1 + AUDIO.swell), t, 0.3);
+  // The generated tunes swell with the finale; the player's own (fully mixed) tracks duck a little under it instead.
+  const own = ownMusicActive();
+  const level = AUDIO.musicMode === MUSIC_OFF ? 0 : own ? 0.8 * (1 - 0.5 * AUDIO.swell) : 1 + AUDIO.swell;
+  AUDIO.music.gain.setTargetAtTime(0.5 * SETTINGS.music * level, t, 0.3);
   AUDIO.fx.gain.setTargetAtTime(0.85 * SETTINGS.sfx, t, 0.05);
   AUDIO.amb.gain.setTargetAtTime(SETTINGS.ambient ? 0.5 * SETTINGS.sfx : 0, t, 0.3);
 }
@@ -13498,11 +13519,33 @@ function voice(key, vol = 1, house = null) {
 const TUNE_ESTI = { bpm: 72, chords: [[62, 66, 69], [59, 62, 66], [55, 59, 62], [57, 61, 64], [62, 66, 69], [55, 59, 62], [57, 61, 64], [62, 66, 69]] };
 const TUNE_GYERTYA = { bpm: 64, chords: [[57, 60, 64], [53, 57, 60], [55, 59, 62], [52, 55, 59], [57, 60, 64], [50, 53, 57], [52, 56, 59], [57, 60, 64]] };
 
-function cycleMusic() {
-  AUDIO.musicMode = (AUDIO.musicMode + 1) % 3;
-  toast(fmt(TXT.toastMusic, { name: TXT.musicNames[AUDIO.musicMode] }));
-  applyVolumes();
+/** The music box order: Saját zenék (when there are any), then the generated tunes, then silence. */
+function musicModes() {
+  return OWN_MUSIC.tracks.length ? [MUSIC_OWN, MUSIC_ESTI, MUSIC_GYERTYA, MUSIC_OFF] : [MUSIC_ESTI, MUSIC_GYERTYA, MUSIC_OFF];
+}
+
+function musicModeName(m = AUDIO.musicMode) {
+  return m === MUSIC_OWN ? TXT.musicOwn : TXT.musicNames[m] || '';
+}
+
+/** Switches the music mode (the own playlist fades in or out; the generated tunes start on the next beat). */
+function setMusicMode(m) {
+  const was = AUDIO.musicMode;
+  AUDIO.musicMode = m;
   if (AUDIO.ctx) AUDIO.nextT = AUDIO.ctx.currentTime + 0.1;
+  if (m === MUSIC_OWN && OWN_MUSIC.tracks.length) ownMusicStart();
+  else if (was === MUSIC_OWN || OWN_MUSIC.cur >= 0) ownMusicStop(1.2);
+  applyVolumes();
+}
+
+/** Zenélő doboz: the next music mode. */
+function cycleMusic() {
+  const list = musicModes();
+  const i = list.indexOf(AUDIO.musicMode);
+  AUDIO.musicPicked = true;
+  setMusicMode(list[(i + 1) % list.length]);
+  toast(fmt(TXT.toastMusic, { name: musicModeName() }));
+  markDirty();
 }
 
 function musicSwell() {
@@ -13516,8 +13559,9 @@ function musicSwell() {
 
 function scheduleMusic() {
   const ctx = AUDIO.ctx;
-  if (AUDIO.musicMode === 2) return;
-  const tune = AUDIO.musicMode === 0 ? TUNE_ESTI : TUNE_GYERTYA;
+  if (AUDIO.musicMode === MUSIC_OFF || ownMusicActive()) return;
+  // Mode "own" while the tracks are still being looked for (or none are left) plays the evening tune meanwhile.
+  const tune = AUDIO.musicMode === MUSIC_GYERTYA ? TUNE_GYERTYA : TUNE_ESTI;
   const eighth = 60 / tune.bpm / 2;
   if (AUDIO.nextT < ctx.currentTime) AUDIO.nextT = ctx.currentTime + 0.05;
   while (AUDIO.nextT < ctx.currentTime + 0.35) {
@@ -13526,7 +13570,7 @@ function scheduleMusic() {
     const chord = tune.chords[Math.floor(bar / 4) % tune.chords.length];
     const pos = s % 8;
     const t = AUDIO.nextT;
-    if (AUDIO.musicMode === 0) {
+    if (tune === TUNE_ESTI) {
       const pat = [0, 1, 2, 1, 0, 2, 1, 2];
       const n = chord[pat[pos]] + 12 + (pos === 4 && bar % 2 ? 12 : 0);
       tone(midi(n), 'sine', t, 0.9, 0.045, AUDIO.music, { attack: 0.003 });
@@ -13541,6 +13585,325 @@ function scheduleMusic() {
     }
     AUDIO.step++;
     AUDIO.nextT += eighth;
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------
+   The player's own music: assets/music/zene-1 … zene-20 (.mp3, .ogg or .m4a), uploaded on GitHub without a build.
+   Found at run time with cheap probes (the service worker answers them without 404s), played as a playlist on two
+   HTMLAudioElement decks routed into AUDIO.music (master and music volume apply), crossfading between tracks.
+   ------------------------------------------------------------------------------------------------ */
+const OWN_MUSIC = {
+  dir: 'assets/music/', max: 20, exts: [['mp3', 'audio/mpeg'], ['ogg', 'audio/ogg'], ['m4a', 'audio/mp4']],
+  state: 'idle', tracks: [], decks: [], cur: -1, idx: 0, token: 0, paused: false, needGesture: false, viaWorker: false,
+  xfade: 3.5, fadeIn: 2.5, fadeOut: 1.2, blobs: new Map(),
+};
+
+/** True while the playlist is the music that plays (own mode chosen and tracks available). */
+function ownMusicActive() {
+  return AUDIO.musicMode === MUSIC_OWN && OWN_MUSIC.tracks.length > 0;
+}
+
+/** After loading a save: own mode waits for the discovery; anything else simply plays. */
+function musicModeRestored() {
+  if (OWN_MUSIC.state === 'ready' && ownMusicActive()) ownMusicStart();
+  else if (OWN_MUSIC.state === 'none' && AUDIO.musicMode === MUSIC_OWN) AUDIO.musicMode = MUSIC_ESTI;
+  else if (OWN_MUSIC.state === 'ready' && !AUDIO.musicPicked && AUDIO.musicMode !== MUSIC_OWN) setMusicMode(MUSIC_OWN);
+  applyVolumes();
+}
+
+/** True when the controlling service worker answers the music handshake (an older version of it does not). */
+function ownMusicWorkerReady(ms = 1500) {
+  return new Promise((resolve) => {
+    try {
+      const ctl = navigator.serviceWorker && navigator.serviceWorker.controller;
+      if (!ctl || typeof MessageChannel === 'undefined') {
+        resolve(false);
+        return;
+      }
+      const ch = new MessageChannel();
+      const timer = setTimeout(() => resolve(false), ms);
+      ch.port1.onmessage = (e) => {
+        clearTimeout(timer);
+        resolve(!!(e.data && e.data.music));
+      };
+      ctl.postMessage({ type: 'music?' }, [ch.port2]);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Waits (bounded) for a service worker that handles the music probes, so a missing file is answered without a 404
+ * and nothing is downloaded: it checks for an update of the worker (a new upload) and waits for it to take over.
+ */
+async function ownMusicWorker(ms) {
+  try {
+    if (!('serviceWorker' in navigator)) return false;
+    const sw = navigator.serviceWorker;
+    const until = performance.now() + ms;
+    let reg = await sw.getRegistration();
+    if (!reg) {
+      // The page registers its worker on load; give it a moment.
+      await new Promise((r) => { setTimeout(r, 1500); });
+      reg = await sw.getRegistration();
+      if (!reg) return false;
+    }
+    if (await ownMusicWorkerReady()) return true;
+    try {
+      await reg.update();
+    } catch {
+      /* offline: keep what is there */
+    }
+    while (performance.now() < until) {
+      // A newer worker is installing, waiting or activating: wait for it to take over the page.
+      const pending = reg.installing || reg.waiting || (reg.active && reg.active !== sw.controller);
+      if (!pending && sw.controller) break;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 1000);
+        sw.addEventListener('controllerchange', () => {
+          clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+      if (await ownMusicWorkerReady(800)) return true;
+    }
+  } catch {
+    /* no worker: probe directly */
+  }
+  return false;
+}
+
+/**
+ * True when a music file exists. Through a music-aware worker: 200 found, 204 missing (no 404 reaches the page);
+ * otherwise HEAD (or a one-byte GET where HEAD is refused).
+ */
+async function ownMusicProbe(url) {
+  try {
+    if (OWN_MUSIC.viaWorker) {
+      const r = await fetch(url, { headers: { 'x-music-probe': '1' }, cache: 'no-store' });
+      return r.status === 200;
+    }
+    let r = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+    if (r.status === 405 || r.status === 501) r = await fetch(url, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
+    return r.status === 200 || r.status === 206;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Looks for zene-1, zene-2, … (each as .mp3, .ogg, .m4a, formats this browser cannot play are skipped) and stops at the
+ * first number that has no file, so a shop without music costs three tiny requests. Runs once, after the first
+ * gesture, and only on the GitHub Pages site (the artifact build has no music folder).
+ */
+async function discoverOwnMusic() {
+  if (OWN_MUSIC.state !== 'idle') return;
+  OWN_MUSIC.state = 'probing';
+  try {
+    if (!document.querySelector('link[rel="manifest"]')) {
+      OWN_MUSIC.state = 'none';
+      musicModeRestored();
+      return;
+    }
+    OWN_MUSIC.viaWorker = await ownMusicWorker(30000);
+    const probe = document.createElement('audio');
+    const exts = OWN_MUSIC.exts.filter(([, mime]) => probe.canPlayType(mime) !== '');
+    for (let n = 1; n <= OWN_MUSIC.max; n++) {
+      let found = null;
+      for (const [ext] of exts) {
+        const url = `${OWN_MUSIC.dir}zene-${n}.${ext}`;
+        if (await ownMusicProbe(url)) {
+          found = url;
+          break;
+        }
+      }
+      if (!found) break;
+      OWN_MUSIC.tracks.push({ url: found, n, name: fmt(TXT.musicOwnTrack, { n }), bad: false });
+    }
+  } catch {
+    /* no music: the generated tunes stay */
+  }
+  OWN_MUSIC.state = OWN_MUSIC.tracks.length ? 'ready' : 'none';
+  if (OWN_MUSIC.tracks.length) {
+    if (!AUDIO.musicPicked) {
+      setMusicMode(MUSIC_OWN);
+      toast(fmt(TXT.toastOwnFound, { n: OWN_MUSIC.tracks.length }));
+    } else musicModeRestored();
+  } else musicModeRestored();
+}
+
+/** One deck: an audio element, its source node and a fade gain into AUDIO.music. */
+function ownDeck(i) {
+  let d = OWN_MUSIC.decks[i];
+  if (d) return d;
+  const el = new Audio();
+  el.preload = 'auto';
+  const src = AUDIO.ctx.createMediaElementSource(el);
+  const g = AUDIO.ctx.createGain();
+  g.gain.value = 0;
+  src.connect(g);
+  g.connect(AUDIO.music);
+  d = { el, g, track: -1, url: '', next: false, stopAt: 0 };
+  el.addEventListener('ended', () => {
+    // Tracks without a known duration (or a missed crossfade) move on at their end.
+    if (OWN_MUSIC.decks[OWN_MUSIC.cur] === d && !d.next && ownMusicActive()) {
+      d.next = true;
+      ownMusicPlay((OWN_MUSIC.idx + 1) % OWN_MUSIC.tracks.length, 0.4);
+    }
+  });
+  OWN_MUSIC.decks[i] = d;
+  return d;
+}
+
+/** Object URL of a track's file (fetched through the worker: cache-first, so it also plays offline). */
+async function ownMusicBlob(tr) {
+  const have = OWN_MUSIC.blobs.get(tr.url);
+  if (have) return have;
+  const res = await fetch(tr.url);
+  if (res.status !== 200) throw new Error(`music ${res.status}`);
+  const url = URL.createObjectURL(await res.blob());
+  OWN_MUSIC.blobs.set(tr.url, url);
+  return url;
+}
+
+/** Releases the object URLs no deck plays and that are not the next track. */
+function ownMusicTrim(keep) {
+  for (const [k, u] of OWN_MUSIC.blobs) {
+    if (keep.includes(k)) continue;
+    URL.revokeObjectURL(u);
+    OWN_MUSIC.blobs.delete(k);
+  }
+}
+
+/** Starts track i on the idle deck, fading it in over fade seconds while the other deck fades out. */
+async function ownMusicPlay(i, fade) {
+  const n = OWN_MUSIC.tracks.length;
+  if (!n || !AUDIO.ctx) return;
+  const token = ++OWN_MUSIC.token;
+  let tr = OWN_MUSIC.tracks[i];
+  let url = '';
+  for (let k = 0; k < n; k++) {
+    tr = OWN_MUSIC.tracks[(i + k) % n];
+    if (tr.bad) continue;
+    try {
+      url = await ownMusicBlob(tr);
+      i = (i + k) % n;
+      break;
+    } catch {
+      tr.bad = true;
+    }
+  }
+  if (token !== OWN_MUSIC.token || !ownMusicActive()) return;
+  if (!url) {
+    // Nothing playable (offline before the first play, or broken files): back to the music box tunes.
+    OWN_MUSIC.tracks.length = 0;
+    setMusicMode(MUSIC_ESTI);
+    return;
+  }
+  const prev = OWN_MUSIC.cur >= 0 ? OWN_MUSIC.decks[OWN_MUSIC.cur] : null;
+  const di = OWN_MUSIC.cur === 0 ? 1 : 0;
+  const d = ownDeck(di);
+  const t = AUDIO.ctx.currentTime;
+  d.el.src = url;
+  d.track = i;
+  d.url = tr.url;
+  d.next = false;
+  d.stopAt = 0;
+  d.g.gain.cancelScheduledValues(t);
+  d.g.gain.setValueAtTime(0, t);
+  try {
+    await d.el.play();
+  } catch (err) {
+    // Blocked until the next user gesture (autoplay rules): audioUnlock() tries again; otherwise the file is broken.
+    if (err && err.name === 'NotAllowedError') {
+      OWN_MUSIC.needGesture = true;
+      return;
+    }
+    tr.bad = true;
+    if (token === OWN_MUSIC.token && OWN_MUSIC.tracks.some((x) => !x.bad)) ownMusicPlay((i + 1) % n, fade);
+    return;
+  }
+  if (token !== OWN_MUSIC.token) return;
+  const t1 = AUDIO.ctx.currentTime;
+  d.g.gain.setValueAtTime(0, t1);
+  d.g.gain.linearRampToValueAtTime(1, t1 + Math.max(0.05, fade));
+  if (prev && prev !== d) ownDeckFadeOut(prev, Math.max(0.3, fade));
+  OWN_MUSIC.cur = di;
+  OWN_MUSIC.idx = i;
+  OWN_MUSIC.paused = false;
+  toast(fmt(TXT.toastTrack, { name: tr.name }));
+  // Fetch the next track now, so the crossfade starts on time; keep only these two files in memory.
+  const nx = OWN_MUSIC.tracks[(i + 1) % n];
+  ownMusicTrim([tr.url, nx.url]);
+  if (!nx.bad) ownMusicBlob(nx).catch(() => { nx.bad = true; });
+}
+
+function ownDeckFadeOut(d, s) {
+  const t = AUDIO.ctx.currentTime;
+  d.g.gain.cancelScheduledValues(t);
+  d.g.gain.setValueAtTime(d.g.gain.value, t);
+  d.g.gain.linearRampToValueAtTime(0, t + s);
+  d.stopAt = performance.now() + s * 1000 + 100;
+  d.next = true;
+}
+
+function ownMusicStart() {
+  if (!AUDIO.ctx || !OWN_MUSIC.tracks.length) return;
+  const d = OWN_MUSIC.cur >= 0 ? OWN_MUSIC.decks[OWN_MUSIC.cur] : null;
+  if (d && !d.el.paused && d.stopAt === 0) return;
+  ownMusicPlay(OWN_MUSIC.idx % OWN_MUSIC.tracks.length, OWN_MUSIC.fadeIn);
+}
+
+/** Fades the playlist out (switching to another mode); the decks pause once silent. */
+function ownMusicStop(s = OWN_MUSIC.fadeOut) {
+  OWN_MUSIC.token++;
+  if (!AUDIO.ctx) return;
+  for (const d of OWN_MUSIC.decks) if (d && !d.el.paused) ownDeckFadeOut(d, s);
+  OWN_MUSIC.cur = -1;
+}
+
+/** Hidden tab: pause the decks (the context is suspended too) and continue where they were. */
+function ownMusicPause() {
+  for (const d of OWN_MUSIC.decks) {
+    if (d && !d.el.paused) {
+      d.el.pause();
+      d.wasPlaying = true;
+    }
+  }
+  OWN_MUSIC.paused = true;
+}
+
+function ownMusicResume() {
+  if (!OWN_MUSIC.paused) return;
+  OWN_MUSIC.paused = false;
+  for (const d of OWN_MUSIC.decks) {
+    if (d && d.wasPlaying) {
+      d.wasPlaying = false;
+      d.el.play().catch(() => {});
+    }
+  }
+}
+
+/** Per frame: start the crossfade into the next track before the current one ends; pause decks that faded out. */
+function ownMusicTick() {
+  const now = performance.now();
+  for (const d of OWN_MUSIC.decks) {
+    if (d && d.stopAt && now >= d.stopAt) {
+      d.stopAt = 0;
+      d.el.pause();
+      d.el.removeAttribute('src');
+      d.el.load();
+    }
+  }
+  if (!ownMusicActive() || OWN_MUSIC.cur < 0 || OWN_MUSIC.paused) return;
+  const d = OWN_MUSIC.decks[OWN_MUSIC.cur];
+  if (!d || d.next || d.el.paused) return;
+  const dur = d.el.duration;
+  if (Number.isFinite(dur) && dur > 1 && d.el.currentTime >= dur - Math.min(OWN_MUSIC.xfade, dur * 0.3)) {
+    d.next = true;
+    ownMusicPlay((OWN_MUSIC.idx + 1) % OWN_MUSIC.tracks.length, Math.min(OWN_MUSIC.xfade, dur * 0.3));
   }
 }
 
@@ -13578,6 +13941,7 @@ function audioTick(dt) {
   if (!audioReady()) return;
   try {
     scheduleMusic();
+    ownMusicTick();
     if (!SETTINGS.ambient) return;
     const t = AUDIO.ctx.currentTime;
     AUDIO.ambT -= dt;
@@ -15693,7 +16057,7 @@ function makeSaveData() {
     register: GAME.register, events: { ...GAME.events }, snitch: { caught: GAME.snitch.caught },
     flags: { ...GAME.flags }, stats: { ...GAME.stats }, ach: GAME.ach.slice(),
     cam: { x: Math.round(PLAYER.pos.x * 100) / 100, z: Math.round(PLAYER.pos.z * 100) / 100, yaw: Math.round(PLAYER.yaw * 1000) / 1000, pitch: Math.round(PLAYER.pitch * 1000) / 1000 },
-    name: GAME.name, tips: [...GAME.tipsShown], sortedCount: GAME.sorted, elvesT: Math.round(ELVES.t), music: AUDIO.musicMode,
+    name: GAME.name, tips: [...GAME.tipsShown], sortedCount: GAME.sorted, elvesT: Math.round(ELVES.t), music: AUDIO.musicMode, musicPick: AUDIO.musicPicked,
     layout: LAYOUT_VERSION,
   };
 }
@@ -15846,7 +16210,10 @@ function applySaveData(d) {
   GAME.name = typeof d.name === 'string' && d.name ? d.name.slice(0, 24) : TXT.setNameDefault;
   GAME.tipsShown = new Set(Array.isArray(d.tips) ? d.tips : []);
   ELVES.t = +d.elvesT || 0;
-  if (Number.isFinite(d.music)) AUDIO.musicMode = clampTo(d.music | 0, 0, 2);
+  if (Number.isFinite(d.music)) AUDIO.musicMode = clampTo(d.music | 0, 0, MUSIC_OWN);
+  AUDIO.musicPicked = !!d.musicPick;
+  // The saved mode is applied once the player's own tracks are known (found, or none).
+  musicModeRestored();
   // Figurines: shelved ones first (slots), then loose and wild poses, then the stack in order.
   // A save from an older layout (smaller figurines, other heaps) keeps its shelves, stack and progress; its heap
   // figurines, hidden legendary copies and runaways stay where spawnAll() just put them in the new heaps, and
@@ -16650,7 +17017,7 @@ const DEBUG_API = {
   },
   /** Live engine objects for automated diagnostics (not used by the game itself). */
   internals() {
-    return { THREE, scene, camera, renderer, kit, composer, GAME, REC, WORLD, SNITCH, SETTINGS, MENU, LOOP, PLATES, slotPlateState, leavePile, PILE };
+    return { THREE, scene, camera, renderer, kit, composer, GAME, REC, WORLD, SNITCH, SETTINGS, MENU, LOOP, PLATES, slotPlateState, leavePile, PILE, AUDIO, OWN_MUSIC, cycleMusic };
   },
   /** Stands about `dist` metres from a world point on free floor and looks at it (Snitch, interactables, spots). */
   aimPoint(x, y, z, dist = 1.1) {

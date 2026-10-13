@@ -13,7 +13,8 @@ A mappában ezek vannak:
 - `sw.js` – az offline működéshez kell (az első megnyitás után internet nélkül is indul)
 - `manifest.webmanifest` és az `icons` mappa – az ikon és a telepíthető alkalmazás adatai
 - `assets` mappa – a textúrák és a figurák adatai (`figures-baked`), és ha lesznek, a saját 3D-s figurák;
-  ez nélkülözhetetlen, a teljes mappát töltsd fel
+  ez nélkülözhetetlen, a teljes mappát töltsd fel. Az `assets/music` mappába kerülhetnek a saját zenéid
+  (lásd a 7. pontot).
 - `figures-preview.html` – a figurák előnézete (nem kötelező, de nem is árt)
 - ez az `OLVASSEL.md` (nem kötelező feltölteni)
 
@@ -95,3 +96,25 @@ A játék a böngésző saját tárolójában ment, két váltakozó mentéshell
 mentés sem rontja el a haladást. A Szünet menüben látszik, mikor volt az utolsó mentés, és ott
 van a **Mentés törlése** is (megerősítést kér). Ha törlöd a böngészőadatokat, a mentés is
 elvész.
+
+---
+
+## 7. Saját zene
+
+A játék a saját háttérzenéidet is lejátssza. Nem kell hozzá semmit összerakni, elég feltölteni a
+fájlokat a GitHubon.
+
+1. Nevezd el a fájlokat így: `zene-1.mp3`, `zene-2.mp3`, `zene-3.mp3` … legfeljebb `zene-20`
+   (kisbetűvel, szóköz nélkül, a számozás 1-től, kihagyás nélkül). `.ogg` és `.m4a` is jó
+   ugyanilyen névvel. MP3-nál 160–192 kbit/s ajánlott; egy fájl legfeljebb 25 MB lehet.
+2. A tárolóban nyisd meg az `assets` mappát, majd **Add file → Upload files**. Ha még nincs
+   `music` mappa, húzd be a gépeden előkészített `music` mappát a zenékkel együtt (a GitHub üres
+   mappát nem tárol, ezért a mappa az első zenével együtt jön létre). Ha már van, nyisd meg az
+   `assets/music` mappát, és oda töltsd fel a fájlokat. Végül **Commit changes**.
+3. Egy-két perc múlva, a játék újratöltése után a saját zene lesz az alapértelmezett. A pult
+   **zenélő dobozával** válthatsz: Saját zenék → Esti dallam → Gyertyafény → Csend. A hangerőt a
+   Beállítások **Zene hangereje** csúszkája állítja. Az első lejátszás után internet nélkül is szól.
+
+A tároló nyilvános, a zenéket bárki letöltheti: csak saját vagy szabad licencű (CC0, CC-BY a
+szerző feltüntetésével) zenét tölts fel. A játék frissítésekor (4. pont) a zenék megmaradnak, a
+feltöltés nem törli őket. Részletek: `assets/music/OLVASSEL-ZENE.txt`.
