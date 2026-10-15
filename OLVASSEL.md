@@ -55,6 +55,17 @@ játék, ezért a linket ne oszd meg szélesebb körben.
    Ha ezután a kontroller nem reagál, nyomd meg kétszer az **Xbox** gombot.
 5. A haladást a játék az Xbox böngészőjében menti, automatikusan, kb. félpercenként és
    szüneteltetéskor.
+6. Xboxon a játék magától a **Xbox (könnyű)** beállítással indul (720p-ről indul, és ha bírja, 1080p-re vált).
+   Ha betöltés közben leáll a grafika („WebGL context lost”), a játék magától újratölt **Mentő módban**.
+   Ha ez többször egymás után megtörténik, **zárd be teljesen az Edge-et**: nyomd meg az Xbox gombot, álj az
+   Edge-re, nyomd meg a Menü gombot, és válaszd a **Kilépés** pontot. Utána nyisd meg újra az Edge-et és a játékot.
+   Részletek: 8. pont.
+7. **Ha nem jut el a menüig:** a betöltőképernyő alján van egy **„Nem tölt be? Indítás Mentő módban”** gomb.
+   Kontrollerrel nyomj lefelé (kar vagy iránygomb), majd **A**. Ha a grafika leállt, a megjelenő ablakban az
+   **„Újraindítás könnyebb módban”** gomb van kijelölve: nyomd meg az **A** gombot.
+   Menü nélkül is választhatsz fokozatot: írd a cím végére, hogy `#mento`, például
+   `https://puxi63.github.io/varazsvicc/#mento` (vagy `#xbox`, `#kozepes`, `#magas`). A játék ezzel a fokozattal
+   indul, és meg is jegyzi; később a Beállítások → Teljesítmény pontban visszaválthatsz.
 
 ---
 
@@ -78,6 +89,10 @@ Ha új változat készül (`node build.mjs` a `game` mappában), töltsd fel új
 teljes tartalmát ugyanebbe a tárolóba (**Add file → Upload files**, a régi fájlokat felülírja),
 majd **Commit changes**. A `sw.js` verziója magától változik, így a következő megnyitáskor az
 új változat jön be. Ha mégis a régi látszik, töltsd újra az oldalt még egyszer.
+
+Az offline működés: az első megnyitáskor a játék csak azt menti el, amit éppen betölt (így az első
+betöltés nem lassul). Kb. egy perc játék után a háttérben a többit is letölti; onnantól internet nélkül
+is indul.
 
 ---
 
@@ -104,7 +119,7 @@ elvész.
 A játék a saját háttérzenéidet is lejátssza. Nem kell hozzá semmit összerakni, elég feltölteni a
 fájlokat a GitHubon.
 
-1. Nevezd el a fájlokat így: `zene-1.mp3`, `zene-2.mp3`, `zene-3.mp3` … legfeljebb `zene-20`
+1. Nevezd el a fájlokat így: `zene-1.mp3`, `zene-2.mp3`, `zene-3.mp3` … legfeljebb `zene-100`
    (kisbetűvel, szóköz nélkül, a számozás 1-től, kihagyás nélkül). `.ogg` és `.m4a` is jó
    ugyanilyen névvel. MP3-nál 160–192 kbit/s ajánlott; egy fájl legfeljebb 25 MB lehet.
 2. A tárolóban nyisd meg az `assets` mappát, majd **Add file → Upload files**. Ha még nincs
@@ -112,9 +127,55 @@ fájlokat a GitHubon.
    mappát nem tárol, ezért a mappa az első zenével együtt jön létre). Ha már van, nyisd meg az
    `assets/music` mappát, és oda töltsd fel a fájlokat. Végül **Commit changes**.
 3. Egy-két perc múlva, a játék újratöltése után a saját zene lesz az alapértelmezett. A pult
-   **zenélő dobozával** válthatsz: Saját zenék → Esti dallam → Gyertyafény → Csend. A hangerőt a
-   Beállítások **Zene hangereje** csúszkája állítja. Az első lejátszás után internet nélkül is szól.
+   **zenélő dobozával** válthatsz: Saját zenék → Saját zenék, keverve → Esti dallam → Gyertyafény → Csend.
+   A **keverés** (véletlen sorrend) a Beállítások → Hang → **Keverés (saját zenék)** pontban is be- és
+   kikapcsolható, és a mentéssel együtt megmarad. A hangerőt a **Zene hangereje** csúszkája állítja.
+   Az első lejátszás után internet nélkül is szól: a játék a legutóbb hallgatott 10 zenét (legfeljebb kb.
+   60 MB-ot) tartja meg, hogy az Xbox tárhelye ne teljen meg; a régebbiek újra letöltődnek, ha sorra kerülnek.
 
 A tároló nyilvános, a zenéket bárki letöltheti: csak saját vagy szabad licencű (CC0, CC-BY a
 szerző feltüntetésével) zenét tölts fel. A játék frissítésekor (4. pont) a zenék megmaradnak, a
 feltöltés nem törli őket. Részletek: `assets/music/OLVASSEL-ZENE.txt`.
+
+---
+
+## 8. Teljesítmény és hibaelhárítás
+
+**Beállítások → Kép → Teljesítmény:**
+
+- **Automatikus** (ajánlott): Xboxon az *Xbox (könnyű)*, számítógépen a *Közepes* fokozattal indul. Ha a
+  játék akadozik, először a felbontást csökkenti, aztán az effekteket, aztán a távoli részleteket, és ha ez
+  sem elég, egy fokozattal könnyebbre vált (ezt a következő indításkor is megjegyzi).
+- **Mentő mód**: a leggyengébb gépekre és a grafikai hibák utáni újraindításhoz (720p, egyszerűbb fények).
+- **Xbox (könnyű)**: konzolra, legfeljebb 1080p.
+- **Közepes**: átlagos számítógépre, élsimítással.
+- **Magas**: erős videokártyára, reflektorárnyékkal, fényragyogással és filmszemcsével.
+
+Az élsimítás és a textúrák felbontása csak az oldal újratöltése után változik.
+
+A **Teljesítménypanel** (Beállítások → Kép) a képkocka/másodpercet, a fokozatot, a rajzhívásokat és a
+memóriát mutatja. A panelre kattintva (kontrollerrel a **Nézet** gombbal) a gép adatai is megjelennek –
+Xboxon érdemes erről fényképet készíteni, ha valami nem működik.
+
+**Xbox – ha a grafika leáll („WebGL context lost”):** a játék elmenti a haladást, és Mentő módban indul
+újra. Ha ez ismétlődik, vagy a játék azt írja, hogy a böngésző letiltotta a 3D-s megjelenítést, zárd be
+teljesen az Edge-et: Xbox gomb → álj az Edge-re → Menü gomb → **Kilépés**, majd nyisd meg újra.
+
+**Fokozat menü nélkül:** a cím végére írt `#mento`, `#xbox`, `#kozepes` vagy `#magas` azzal a fokozattal
+indítja a játékot, és el is menti (például `https://puxi63.github.io/varazsvicc/#mento`). A betöltőképernyő
+**„Nem tölt be? Indítás Mentő módban”** gombja (kontrollerrel: lefelé, majd A) és a grafikai hiba utáni
+**„Újraindítás könnyebb módban”** gomb ugyanígy működik.
+
+**Számítógép – ha lassú (alacsony fps):**
+
+1. Az Edge-ben legyen bekapcsolva a grafikus gyorsítás: írd a címsorba, hogy `edge://settings/system`, és
+   kapcsold be a **Grafikus gyorsítás használata, ha elérhető** pontot, majd indítsd újra az Edge-et.
+2. Laptopon, ahol két videokártya van (beépített és külön): Windows **Gépház → Rendszer → Kijelző →
+   Grafika**, keresd meg a **Microsoft Edge** alkalmazást (vagy add hozzá a `msedge.exe` fájlt), majd a
+   **Beállítások** gombbal válaszd a **Nagy teljesítmény** lehetőséget. Indítsd újra az Edge-et.
+3. Hogy melyik videokártyát használja az Edge, az `edge://gpu` oldalon látszik (a *GL_RENDERER* sorban).
+4. A Beállításokban a **Teljesítmény** legyen *Automatikus* (vagy próbáld a *Mentő módot*).
+5. Játék közben a játék magától igazítja a képet: a 60 fps-ért legfeljebb 70 %-ra csökkenti a felbontást
+   (Közepes fokozat), ennél lejjebb, illetve a fényeffektek és a figurák részletességének csökkentéséig csak
+   akkor megy, ha a kép 30 fps alá esne. Ha Automatikus módban egyszer könnyebb fokozatra váltott, egy nap
+   múlva magától újra megpróbálja az eredetit.

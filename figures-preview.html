@@ -279,7 +279,9 @@ const FIG_BAKED_META = {
 
 /*
  * Packed vertex layout shared by every figure and base (TECHNIQUE.md 8 and 10):
- *   position  u16x3 normalised (dequantised by the per-LOD local matrix) or float32x3 (code-built meshes)
+ *   position  u16x4 normalised, w unused (dequantised by the per-LOD local matrix; four components are a native
+ *             D3D11 vertex format, three made ANGLE keep a converted copy of every buffer, XB-7) or float32x3
+ *             (code-built meshes)
  *   aOct      i16x2 octahedral normal          aCol  u8x4 sRGB paint + front AO
  *   aPbr      u8x4 roughness, metalness, clearcoat, back-face AO (bases: a = 255 enamel ring, 128 medallion field)
  */
@@ -318,14 +320,16 @@ function figOctDecode(a, b, out, o) {
   out[o + 2] = z / l;
 }
 
-/** Builds a packed BufferGeometry from typed arrays. */
-function figPackedGeometry(position, posNormalized, oct, col, pbr, index) {
+/** Builds a packed BufferGeometry from typed arrays (posSize 4: the padded u16x4 position of the baked figures). */
+function figPackedGeometry(position, posNormalized, oct, col, pbr, index, posSize = 3) {
   const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(position, 3, posNormalized));
+  g.setAttribute('position', new THREE.BufferAttribute(position, posSize, posNormalized));
   g.setAttribute('aOct', new THREE.BufferAttribute(oct, 2, true));
   g.setAttribute('aCol', new THREE.BufferAttribute(col, 4, true));
   g.setAttribute('aPbr', new THREE.BufferAttribute(pbr, 4, true));
   g.setIndex(new THREE.BufferAttribute(index, 1));
+  for (const k of Object.keys(g.attributes)) g.attributes[k].onUpload(figMarkUploaded);
+  g.index.onUpload(figMarkUploaded);
   return g;
 }
 
@@ -358,7 +362,14 @@ function figDecodeBlock(block, materials, keepFloat) {
     pbr[i * 4 + 2] = Math.round((m.coat ?? 0.5) * 255);
     pbr[i * 4 + 3] = figPbrByte(m, back[i]);
   }
-  const geometry = figPackedGeometry(pos, true, oct, col, pbr, index);
+  // Padded to u16x4 for the GPU (XB-7); the stride-3 array is only read below and then dropped.
+  const pos4 = new Uint16Array(nV * 4);
+  for (let v = 0; v < nV; v++) {
+    pos4[v * 4] = pos[v * 3];
+    pos4[v * 4 + 1] = pos[v * 3 + 1];
+    pos4[v * 4 + 2] = pos[v * 3 + 2];
+  }
+  const geometry = figPackedGeometry(pos4, true, oct, col, pbr, index, 4);
   const dequant = new THREE.Matrix4().makeTranslation(min[0], min[1], min[2]).multiply(new THREE.Matrix4().makeScale(max[0] - min[0], max[1] - min[1], max[2] - min[2]));
   const out = { geometry, dequant, tris: index.length / 3, verts: nV, far: null };
   if (keepFloat) {
@@ -373,15 +384,19 @@ function figDecodeBlock(block, materials, keepFloat) {
   return out;
 }
 
-/** Code-built meshes (bases, placeholders) packed into the shared layout. Positions in cm. */
+/**
+ * Code-built meshes (bases, placeholders) packed into the shared layout. Positions in cm. `indexed` keeps the index of
+ * every part (shared vertices: about a third of the vertices of the non-indexed form, same smooth normals).
+ */
 class FigPaint {
-  constructor() {
+  constructor(indexed = false) {
     this.items = [];
+    this.indexed = indexed;
   }
 
   /** flag goes to aPbr.a (bases: 255 = enamel ring, 128 = medallion field). */
   add(geo, hex, rough = 0.5, metal = 0, coat = 0.5, flag = 0) {
-    const g = geo.index ? geo.toNonIndexed() : geo;
+    const g = geo.index && !this.indexed ? geo.toNonIndexed() : geo;
     if (!g.attributes.normal) g.computeVertexNormals();
     const c = new THREE.Color(hex);
     this.items.push({ g, rgb: [Math.round(c.r * 255), Math.round(c.g * 255), Math.round(c.b * 255)], rough, metal, coat, flag });
@@ -392,17 +407,29 @@ class FigPaint {
   /** Returns { geometry, far } with float positions (dequant = identity). */
   build() {
     let n = 0;
-    for (const it of this.items) n += it.g.attributes.position.count;
+    let ni = 0;
+    for (const it of this.items) {
+      n += it.g.attributes.position.count;
+      ni += it.g.index ? it.g.index.count : it.g.attributes.position.count;
+    }
     const pos = new Float32Array(n * 3);
     const nrm = new Float32Array(n * 3);
     const oct = new Int16Array(n * 2);
     const col = new Uint8Array(n * 4);
     const pbr = new Uint8Array(n * 4);
-    const index = n < 65536 ? new Uint16Array(n) : new Uint32Array(n);
+    const index = n < 65536 ? new Uint16Array(ni) : new Uint32Array(ni);
     let o = 0;
+    let io = 0;
     for (const it of this.items) {
       const p = it.g.attributes.position;
       const nn = it.g.attributes.normal;
+      const base = o;
+      if (it.g.index) {
+        const src = it.g.index.array;
+        for (let i = 0; i < src.length; i++) index[io++] = src[i] + base;
+      } else {
+        for (let i = 0; i < p.count; i++) index[io++] = base + i;
+      }
       for (let i = 0; i < p.count; i++, o++) {
         pos[o * 3] = p.getX(i);
         pos[o * 3 + 1] = p.getY(i);
@@ -419,13 +446,12 @@ class FigPaint {
         pbr[o * 4 + 1] = it.metal * 255;
         pbr[o * 4 + 2] = it.coat * 255;
         pbr[o * 4 + 3] = it.flag;
-        index[o] = o;
       }
       it.g.dispose();
     }
     this.items = [];
     const geometry = figPackedGeometry(pos, false, oct, col, pbr, index);
-    return { geometry, dequant: new THREE.Matrix4(), tris: n / 3, verts: n, far: { pos, nrm, col, pbr, index } };
+    return { geometry, dequant: new THREE.Matrix4(), tris: ni / 3, verts: n, far: { pos, nrm, col, pbr, index } };
   }
 }
 
@@ -450,23 +476,39 @@ const figBaseCache = [null, null, null];
 /**
  * The shared base in bake cm (origin at the bottom centre, radius 3.0, height 1.5): black lacquered walnut, gilt
  * bezels, the enamel band (flag 255, coloured per category in the shader) and the front medallion (flag 128, the
- * category symbol from the atlas). lod 0 about 2k triangles, 1 about 600, 2 about 130.
+ * category symbol from the atlas). Indexed lathes (PERF-PLAN F9): lod 0 32 segments with the full profile (about 1.3k
+ * triangles), lod 1 24 segments with a simplified profile and a flat medallion (about 650; 16 segments showed a
+ * polygonal rim and underside on the covered pile figurines that stay at LOD1 when zoomed in, integration), lod 2 10
+ * segments without the medallion (about 140; the same silhouette as the old far base).
  */
 function figBuildBase(lod) {
   if (figBaseCache[lod]) return figBaseCache[lod];
-  const segs = [48, 20, 10][lod];
-  const P = new FigPaint();
+  const segs = [32, 24, 10][lod];
+  const P = new FigPaint(true);
   const D = FIG_BASE_DIM;
   const k = D.r / 3.53;
   const ky = D.h / 1.8;
   const S = (pts) => pts.map(([r, y]) => [r * k, y * ky]);
-  const bands = lod === 2
-    ? [
+  let bands;
+  if (lod === 2) {
+    bands = [
       [FIG_LACQUER, 0.24, 0, 0.8, 0, [[3.3, 0.0], [3.5, 0.08], [3.53, 0.5]]],
       [0xffffff, 0.15, 0, 1, 255, [[3.53, 0.5], [3.45, 1.2]]],
       [FIG_LACQUER, 0.24, 0, 0.8, 0, [[3.45, 1.2], [3.3, 1.65], [2.9, 1.8], [0.0, 1.8]]],
-    ]
-    : [
+    ];
+  } else if (lod === 1) {
+    // The gilt bezels become flat gold bands (2-3 px at this distance), the enamel band keeps its bulge.
+    bands = [
+      [FIG_LACQUER, 0.22, 0, 1, 0, [[3.3, 0.0], [3.5, 0.08], [3.53, 0.42], [3.38, 0.535]]],
+      [FIG_GOLD, 0.26, 1, 0, 0, [[3.38, 0.535], [3.41, 0.625]]],
+      [0xffffff, 0.12, 0, 1, 255, [[3.41, 0.625], [3.44, 0.9], [3.41, 1.175]]],
+      [FIG_GOLD, 0.26, 1, 0, 0, [[3.41, 1.175], [3.39, 1.265]]],
+      [FIG_LACQUER, 0.22, 0, 1, 0, [[3.39, 1.265], [3.32, 1.55], [2.96, 1.8], [2.78, 1.8]]],
+      [FIG_GOLD, 0.26, 1, 0, 0, [[2.78, 1.8], [2.72, 1.836], [2.66, 1.8]]],
+      [FIG_LACQUER, 0.22, 0, 1, 0, [[2.66, 1.8], [0.0, 1.8]]],
+    ];
+  } else {
+    bands = [
       [FIG_LACQUER, 0.22, 0, 1, 0, [[3.3, 0.0], [3.5, 0.08], [3.53, 0.42], [3.36, 0.535]]],
       [FIG_GOLD, 0.26, 1, 0, 0, [[3.36, 0.535], [3.425, 0.58], [3.36, 0.625]]],
       [0xffffff, 0.12, 0, 1, 255, [[3.36, 0.625], [3.43, 0.75], [3.43, 1.05], [3.36, 1.175]]],
@@ -475,16 +517,22 @@ function figBuildBase(lod) {
       [FIG_GOLD, 0.26, 1, 0, 0, [[2.78, 1.8], [2.72, 1.836], [2.66, 1.8]]],
       [FIG_LACQUER, 0.22, 0, 1, 0, [[2.66, 1.8], [0.0, 1.8]]],
     ];
+  }
   for (const [hex, rough, metal, coat, flag, pts] of bands) P.add(figLathe(S(pts), segs), hex, rough, metal, coat, flag);
   // Underside in the category's enamel colour (flag 255, like the ring band): seen end-on in the figurine piles it is a
   // bright, sortable colour cue instead of a dark hole.
   P.add(figLathe(S([[0.0, 0.0], [3.3, 0.0]]), segs), 0xffffff, 0.6, 0, 0, 255);
-  if (lod < 2) {
+  if (lod === 0) {
     /* Medallion: gilt rim and a lacquer field whose symbol comes from the atlas (flag 128) */
-    const ms = lod === 0 ? 28 : 14;
-    P.add(figXf(new THREE.TorusGeometry(D.medR, 0.06, lod === 0 ? 6 : 4, ms), [0, D.medY, D.medZ]), FIG_GOLD, 0.24, 1, 0, 0);
+    const ms = 24;
+    P.add(figXf(new THREE.TorusGeometry(D.medR, 0.06, 5, ms), [0, D.medY, D.medZ]), FIG_GOLD, 0.24, 1, 0, 0);
     P.add(figXf(new THREE.CircleGeometry(D.medR, ms), [0, D.medY, D.medZ + 0.025]), 0x16100c, 0.2, 0, 1, 128);
     P.add(figXf(new THREE.CylinderGeometry(D.medR, D.medR, 0.1, ms, 1, true), [0, D.medY, D.medZ - 0.03], [Math.PI / 2, 0, 0]), FIG_GOLD, 0.3, 1, 0, 0);
+  } else if (lod === 1) {
+    /* Mid-distance medallion: a gilt disc just behind the symbol field (the rim reads as a thin gold ring) */
+    const ms = 12;
+    P.add(figXf(new THREE.CircleGeometry(D.medR + 0.07, ms), [0, D.medY, D.medZ + 0.005]), FIG_GOLD, 0.24, 1, 0, 0);
+    P.add(figXf(new THREE.CircleGeometry(D.medR, ms), [0, D.medY, D.medZ + 0.03]), 0x16100c, 0.2, 0, 1, 128);
   }
   figBaseCache[lod] = P.build();
   return figBaseCache[lod];
@@ -591,6 +639,9 @@ function figAcceptBaked(id, json) {
   const blocks = json.lods || [];
   lods.push(blocks[0] ? figDecodeBlock(blocks[0], json.materials, false) : lods[0]);
   lods.push(blocks[1] ? figDecodeBlock(blocks[1], json.materials, true) : figDecodeBlock(blocks[0] || json, json.materials, true));
+  // Xbox / Mentő (PERF-PLAN F3): the full-detail arrays are only needed for the first upload. Nothing that shares
+  // them is ever disposed (figDisposeOwn), and the batches build from the mid and far LODs, which stay in memory.
+  if (lods[0] !== lods[1] && lods[0] !== lods[2] && !figKeepCpu()) figReleaseAfterUpload(lods[0].geometry);
   const g = figGeo(id);
   g.lods = lods;
   g.baked = true;
@@ -598,20 +649,114 @@ function figAcceptBaked(id, json) {
   for (const l of FIG_LOAD.listeners) l.onDesignLoaded?.(id);
 }
 
-/** DESIGN.md 16.5: geometry of one design without the base, in metres, origin at the base top. Never throws. */
+/** True when CPU copies of uploaded buffers must stay (PC tiers: in-place context restore). W decides per tier. */
+function figKeepCpu() {
+  try {
+    return typeof keepCpuCopies === 'function' ? keepCpuCopies() !== false : true;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Frees a dropped typed array's memory at once (XB-1): a view that spans its whole ArrayBuffer is detached with
+ * ArrayBuffer.prototype.transfer(0), so its backing store is released now instead of at the next garbage collection
+ * (the world and full-detail figure arrays became tens of MB of dead buffers right at the load peak). Only for arrays
+ * nothing else reads any more; where transfer() is missing, the collector frees it as before.
+ */
+function figFreeArray(a) {
+  try {
+    const b = a && a.buffer;
+    if (b && typeof b.transfer === 'function' && a.byteOffset === 0 && a.byteLength === b.byteLength) b.transfer(0);
+  } catch {
+    /* left to the garbage collector */
+  }
+}
+
+/** onUpload callback: drops the CPU array of an attribute once the GPU has it (its byte size is remembered). */
+function figReleaseArray() {
+  this.figUp = true;
+  if (this.array) {
+    this.figBytes = this.array.byteLength;
+    figFreeArray(this.array);
+  }
+  this.array = null;
+}
+
+/** onUpload callback: marks an attribute as living on the GPU (the figure memory statistics count only those). */
+function figMarkUploaded() {
+  this.figUp = true;
+}
+
+function figReleaseAfterUpload(geometry) {
+  for (const k of Object.keys(geometry.attributes)) {
+    const a = geometry.attributes[k];
+    // Interleaved attributes share their buffer (the region batches' position + handle record).
+    (a.isInterleavedBufferAttribute ? a.data : a).onUpload(figReleaseArray);
+  }
+  if (geometry.index) geometry.index.onUpload(figReleaseArray);
+}
+
+/** GPU bytes of an attribute (also after its CPU array was released; 0 while it was never uploaded). */
+function figAttrBytes(a) {
+  const d = a && a.isInterleavedBufferAttribute ? a.data : a;
+  if (!d || !d.figUp) return 0;
+  return d.array ? d.array.byteLength : d.figBytes || 0;
+}
+
+/**
+ * Disposes a geometry's GPU state except what it shares with other geometries: the named attributes (and the index
+ * when shareIndex) are detached first, so three.js deletes only this geometry's own buffers and vertex arrays.
+ */
+function figDisposeOwn(geometry, shared, shareIndex = true) {
+  for (const k of shared) if (geometry.attributes[k]) geometry.deleteAttribute(k);
+  if (shareIndex) geometry.setIndex(null);
+  geometry.dispose();
+}
+
+/**
+ * DESIGN.md 16.5: geometry of one design without the base, in metres, origin at the base top. Never throws. The metre
+ * geometry is made only when `opaque` / `translucent` is read (the loader only needs the side effect of starting the
+ * download); it is null when the full-detail arrays were already released after upload.
+ */
 function buildFigureGeometry(designId) {
   figStartLoading();
   const d = FIG_BY_ID[designId];
   if (!d) throw new Error(`[figures] unknown design ${designId}`);
   const g = figGeo(designId);
   const e = g.lods[0];
-  if (!e.geometryM) {
-    e.geometryM = e.geometry.clone();
-    e.geometryM.applyMatrix4(new THREE.Matrix4().makeScale(FIG_CM, FIG_CM, FIG_CM).multiply(e.dequant));
-    e.geometryM.computeBoundingSphere();
-  }
   const met = getFigureMetrics(designId);
-  return { opaque: g.ghost ? null : e.geometryM, translucent: g.ghost ? e.geometryM : null, height: met.figH, radius: met.radius, tris: e.tris, baked: g.baked };
+  const metre = () => {
+    if (!e.geometryM) {
+      const p = e.geometry.attributes.position;
+      if (!p.array) return null;
+      const src = e.geometry;
+      const geo = new THREE.BufferGeometry();
+      const fp = new Float32Array(p.count * 3);
+      const m = new THREE.Matrix4().makeScale(FIG_CM, FIG_CM, FIG_CM).multiply(e.dequant);
+      for (let v = 0; v < p.count; v++) {
+        figV1.set(p.getX(v), p.getY(v), p.getZ(v)).applyMatrix4(m);
+        fp[v * 3] = figV1.x;
+        fp[v * 3 + 1] = figV1.y;
+        fp[v * 3 + 2] = figV1.z;
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(fp, 3));
+      for (const k of ['aOct', 'aCol', 'aPbr']) geo.setAttribute(k, src.attributes[k]);
+      geo.setIndex(src.index);
+      geo.computeBoundingSphere();
+      e.geometryM = geo;
+    }
+    return e.geometryM;
+  };
+  return {
+    get opaque() {
+      return g.ghost ? null : metre();
+    },
+    get translucent() {
+      return g.ghost ? metre() : null;
+    },
+    height: met.figH, radius: met.radius, tris: e.tris, baked: g.baked,
+  };
 }
 
 const figMetricsCache = {};
@@ -663,36 +808,78 @@ function drawCategorySymbol(ctx, key, x, y, size, opts = {}) {
 
 let figAtlasTex = null;
 
-/** 1024 x 256 symbol atlas: 8 x 2 cells of 128 px, cell index = category index, white symbols on black. */
+/**
+ * 1024 x 256 symbol atlas: 8 x 2 cells of 128 px, cell index = category index, white symbols on black. Stored as a
+ * single-channel R8 texture (the shader reads .r; 0.35 MB with mipmaps instead of 1.4 MB) whose rows are flipped like
+ * a canvas upload; the drawing canvas is released right away (PERF-PLAN F3).
+ */
 function figSymbolAtlas() {
   if (figAtlasTex) return figAtlasTex;
+  const W = 1024;
+  const H = 256;
   const c = document.createElement('canvas');
-  c.width = 1024;
-  c.height = 256;
-  const ctx = c.getContext('2d');
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, 1024, 256);
+  ctx.fillRect(0, 0, W, H);
   for (const cat of FIG_CATEGORIES) {
     const cx = (cat.index % 8) * 128;
     const cy = Math.floor(cat.index / 8) * 128;
     drawCategorySymbol(ctx, cat.key, cx, cy, 128, { color: '#fff', padding: 14, lineWidth: 128 / 11 });
   }
-  figAtlasTex = new THREE.CanvasTexture(c);
+  const rgba = ctx.getImageData(0, 0, W, H).data;
+  const r8 = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const src = (H - 1 - y) * W * 4;
+    const dst = y * W;
+    for (let x = 0; x < W; x++) r8[dst + x] = rgba[src + x * 4];
+  }
+  c.width = 0;
+  c.height = 0;
+  figAtlasTex = new THREE.DataTexture(r8, W, H, THREE.RedFormat, THREE.UnsignedByteType);
+  figAtlasTex.name = 'fig:symbol-atlas';
   figAtlasTex.colorSpace = THREE.NoColorSpace;
   figAtlasTex.anisotropy = 4;
   figAtlasTex.generateMipmaps = true;
   figAtlasTex.minFilter = THREE.LinearMipmapLinearFilter;
+  figAtlasTex.magFilter = THREE.LinearFilter;
+  figAtlasTex.needsUpdate = true;
+  figAtlasTex.figBytes = Math.round(W * H * 4 / 3);
+  if (!figKeepCpu()) {
+    figAtlasTex.onUpdate = (t) => {
+      t.image = { data: null, width: W, height: H };
+    };
+  }
   return figAtlasTex;
 }
 
 /* ---- 23-figures-mat.js ---- */
 /* ==== 23-figures-mat.js — figure materials: the shared painted-resin material (TECHNIQUE.md 10), the ghost material
    and the base material (category enamel band + embossed-looking gold symbol from the atlas). All read the packed
-   attributes; per instance `figInst` = (aim rim highlight, Lumos glow, flash, shelf shimmer). ==== */
+   attributes; per instance `figInst` = (aim rim highlight, Lumos glow, flash, shelf shimmer).
+
+   Variants (PERF-PLAN F2 / F8, at most 10 programs per tier):
+   - figure0  full detail (LOD0), double-sided (open cloth backs); clearcoat (Physical) only on the Magas tier
+   - figureLod  mid and far LODs drawn instanced, front faces only, Standard
+   - figureBatch  region batches (27-figures-perf.js): world-space transform and effects come from the per-handle
+     transform texture (`aHid` per vertex); the batch also carries the bases (part 1) and draws them with the base look
+   - base0 / baseStd  instanced bases (Physical on LOD0 only on Magas), glass / glassBatch for translucent figures,
+     ghost depth pre-pass (instanced and batch) and the aim outline. ==== */
 
 const FIG_MATERIALS = {};
-/** Shared uniforms: animation time (shimmer) and the ghost opacity. */
-const FIG_UNIFORMS = { time: { value: 0 }, ghostAlpha: { value: 1 } };
+/**
+ * Shared uniforms: animation time (shimmer), the ghost opacity, the per-handle transform texture of the region batches
+ * and the quantisation box of the batch base parts (bake cm), which the medallion symbol lookup needs.
+ */
+const FIG_UNIFORMS = {
+  time: { value: 0 }, ghostAlpha: { value: 1 }, xf: { value: null },
+  baseQMin: { value: new THREE.Vector3(0, 0, 0) }, baseQSize: { value: new THREE.Vector3(1, 1, 1) },
+  /** Pixel height of the target the per-vertex lit batches are drawn into, and the factor on their geometry roughness
+   *  (vertex curvature x pixel footprint; 0.7 matched three's per-pixel geometryRoughness best on the proxy). */
+  pxH: { value: 1080 },
+  geoK: { value: 0.7 },
+};
 
 /**
  * Aim highlight (figInst.x, 0..1): a warm fresnel rim that reads as a glowing outline, plus a slight overall lift so
@@ -710,7 +897,6 @@ const FIG_SHADER_VERT_HEAD = [
   'attribute vec2 aOct;',
   'attribute vec4 aCol;',
   'attribute vec4 aPbr;',
-  'attribute vec4 figInst;',
   'varying vec4 vFigCol;',
   'varying vec4 vFigPbr;',
   'varying vec4 vFigInst;',
@@ -722,37 +908,128 @@ const FIG_SHADER_VERT_HEAD = [
 ].join('\n');
 
 /**
- * Patches a MeshStandardMaterial / MeshPhysicalMaterial for the packed layout. kind: 'figure' | 'ghost' | 'base'.
- * aPbr.a: figures = back-face AO (0..200) or glow (201..255); bases = 1.0 enamel ring, 0.5 medallion field.
+ * Batch vertex header: aHid = handle * 4 + part (0 far figure, 1 far base, 2 mid figure, 3 mid base; odd = base), read
+ * as a normalised u16 (the w of the interleaved u16x4 position record, XB-7: a native vertex format on D3D11). The
+ * transform texture holds per handle 16 texels in one row: the matrix rows of the 4 parts (part * 3 .. + 2), effects
+ * (12: rim, glow, flash, shimmer) and the category (13: enamel ring colour linear rgb, category index). A zero matrix
+ * collapses the part (the handle is drawn by another batch or instanced).
  */
-function figPatchMaterial(mat, kind) {
+const FIG_BATCH_VERT_HEAD = [
+  'attribute float aHid;',
+  'uniform highp sampler2D uFigXf;',
+  'uniform vec3 uFigBaseQMin;',
+  'uniform vec3 uFigBaseQSize;',
+  'vec4 figXfTexel(int hnd, int k) {',
+  '  return texelFetch(uFigXf, ivec2((hnd % 32) * 16 + k, hnd / 32), 0);',
+  '}',
+  'mat4 figXfMatrix(int hnd, int part) {',
+  '  vec4 r0 = figXfTexel(hnd, part * 3);',
+  '  vec4 r1 = figXfTexel(hnd, part * 3 + 1);',
+  '  vec4 r2 = figXfTexel(hnd, part * 3 + 2);',
+  '  return mat4(r0.x, r1.x, r2.x, 0.0, r0.y, r1.y, r2.y, 0.0, r0.z, r1.z, r2.z, 0.0, r0.w, r1.w, r2.w, 1.0);',
+  '}',
+].join('\n');
+
+/** Batch transform of position (and of the normal, exactly like three.js does it for an instance matrix). */
+const FIG_BATCH_NORMAL = [
+  'int figId = int(aHid * 65535.0 + 0.5);',
+  'int figHnd = figId / 4;',
+  'int figPart = figId - figHnd * 4;',
+  'mat4 figM = figXfMatrix(figHnd, figPart);',
+  'mat3 figIm = mat3(figM);',
+  'vec3 objectNormal = figOctDecode(aOct);',
+  'objectNormal /= max(vec3(dot(figIm[0], figIm[0]), dot(figIm[1], figIm[1]), dot(figIm[2], figIm[2])), vec3(1e-20));',
+  'objectNormal = figIm * objectNormal;',
+].join('\n');
+
+/**
+ * Base look (enamel band in the category colour, medallion symbol from the atlas). `gate` selects base fragments:
+ * 'true' for the instanced base material, the part varying for the batch material (figures and bases in one draw).
+ */
+function figBaseColorGlsl(gate) {
+  const D = FIG_BASE_DIM;
+  return [
+    `if (${gate}) {`,
+    '  figIsBase = 1.0;',
+    '  figRing = step(0.9, vFigPbr.a);',
+    '  figMed = step(0.4, vFigPbr.a) * (1.0 - figRing);',
+    '  if (figMed > 0.5) {',
+    `    vec2 lu = vec2(vFigLocal.x / ${(2 * D.medR).toFixed(4)} + 0.5, (vFigLocal.y - ${D.medY.toFixed(4)}) / ${(2 * D.medR).toFixed(4)} + 0.5);`,
+    '    lu = clamp(lu, 0.02, 0.98);',
+    '    float cell = floor(vFigBaseCat.w + 0.5);',
+    '    vec2 au = vec2((mod(cell, 8.0) + lu.x) / 8.0, 1.0 - (floor(cell / 8.0) + 1.0) * 0.5 + lu.y * 0.5);',
+    '    figSym = smoothstep(0.35, 0.65, texture2D(uFigAtlas, au).r);',
+    '  }',
+    '  figLin = mix(figLin, vFigBaseCat.rgb, figRing);',
+    '  figLin = mix(figLin, vec3(0.80, 0.56, 0.24), figSym);',
+    '}',
+  ].join('\n');
+}
+
+/**
+ * Patches a MeshStandardMaterial / MeshPhysicalMaterial for the packed layout. kind: 'figure' | 'ghost' | 'base';
+ * batch: region-batch variant (transform texture). aPbr.a: figures = back-face AO (0..200) or glow (201..255);
+ * bases = 1.0 enamel ring, 0.5 medallion field.
+ */
+function figPatchMaterial(mat, kind, batch = false) {
+  const baseCode = kind === 'base' || (batch && kind === 'figure');
+  const gate = kind === 'base' ? 'true' : 'vFigPart > 0.5';
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uFigTime = FIG_UNIFORMS.time;
-    if (kind === 'base') sh.uniforms.uFigAtlas = { value: figSymbolAtlas() };
+    if (baseCode) sh.uniforms.uFigAtlas = { value: figSymbolAtlas() };
+    if (batch) {
+      sh.uniforms.uFigXf = FIG_UNIFORMS.xf;
+      sh.uniforms.uFigBaseQMin = FIG_UNIFORMS.baseQMin;
+      sh.uniforms.uFigBaseQSize = FIG_UNIFORMS.baseQSize;
+    }
+    let vHead = FIG_SHADER_VERT_HEAD;
+    if (batch) vHead += `\n${FIG_BATCH_VERT_HEAD}`;
+    else vHead += '\nattribute vec4 figInst;';
+    if (kind === 'base') vHead += '\nattribute vec4 figBaseCat;\nvarying vec4 vFigBaseCat;\nvarying vec3 vFigLocal;';
+    if (batch && kind === 'figure') vHead += '\nvarying vec4 vFigBaseCat;\nvarying vec3 vFigLocal;\nvarying float vFigPart;';
+    const begin = [];
+    if (batch) {
+      begin.push('vec3 transformed = (figM * vec4(position, 1.0)).xyz;', 'vFigInst = figXfTexel(figHnd, 12);');
+      if (kind === 'figure') {
+        begin.push('vFigPart = float(figPart % 2);', 'vFigBaseCat = figXfTexel(figHnd, 13);', 'vFigLocal = uFigBaseQMin + position * uFigBaseQSize;');
+      }
+    } else {
+      begin.push('#include <begin_vertex>', 'vFigInst = figInst;');
+    }
+    begin.push('vFigCol = aCol;', 'vFigPbr = aPbr;');
+    if (kind === 'base') begin.push('vFigBaseCat = figBaseCat;', 'vFigLocal = position;');
     sh.vertexShader = sh.vertexShader
-      .replace('#include <common>', [
-        '#include <common>',
-        FIG_SHADER_VERT_HEAD,
-        kind === 'base' ? 'attribute vec4 figBaseCat;\nvarying vec4 vFigBaseCat;\nvarying vec3 vFigLocal;' : '',
-      ].join('\n'))
-      .replace('#include <beginnormal_vertex>', 'vec3 objectNormal = figOctDecode(aOct);')
-      .replace('#include <begin_vertex>', [
-        '#include <begin_vertex>',
-        'vFigCol = aCol;',
-        'vFigPbr = aPbr;',
-        'vFigInst = figInst;',
-        kind === 'base' ? 'vFigBaseCat = figBaseCat;\nvFigLocal = position;' : '',
-      ].join('\n'));
-    const D = FIG_BASE_DIM;
+      .replace('#include <common>', `#include <common>\n${vHead}`)
+      .replace('#include <beginnormal_vertex>', batch ? FIG_BATCH_NORMAL : 'vec3 objectNormal = figOctDecode(aOct);')
+      .replace('#include <begin_vertex>', begin.join('\n'));
+    const fHead = [
+      'varying vec4 vFigCol;',
+      'varying vec4 vFigPbr;',
+      'varying vec4 vFigInst;',
+      'uniform float uFigTime;',
+    ];
+    if (baseCode) fHead.push('varying vec4 vFigBaseCat;', 'varying vec3 vFigLocal;', 'uniform sampler2D uFigAtlas;');
+    if (batch && kind === 'figure') fHead.push('varying float vFigPart;');
+    const emissive = [];
+    if (baseCode) {
+      emissive.push(
+        /* bases: a gentle self-lit lift on the enamel band so dark category colours (Ravenclaw blue, Hallows black)
+           still read on the black lacquer at TV distance */
+        'if (figIsBase > 0.5) totalEmissiveRadiance += vFigBaseCat.rgb * figRing * 0.45 + vec3(0.02) * figRing;',
+        'else totalEmissiveRadiance += figLin * max(figPa - 200.0, 0.0) / 55.0 * 2.2;',
+      );
+    } else emissive.push('totalEmissiveRadiance += figLin * max(figPa - 200.0, 0.0) / 55.0 * 2.2;');
+    if (kind === 'ghost') emissive.push('totalEmissiveRadiance += figLin * 0.22;');
+    emissive.push('vec4 figFx = vFigInst;');
+    // Batch bases take half the glow and flash of their figure and no shimmer (as the instanced bases are written).
+    if (batch && kind === 'figure') emissive.push('figFx *= mix(vec4(1.0), vec4(1.0, 0.5, 0.5, 0.0), figIsBase);');
+    emissive.push(
+      'totalEmissiveRadiance += figFx.y * vec3(1.0, 0.82, 0.45) * 0.55 + figFx.z * vec3(1.2);',
+      'totalEmissiveRadiance += figFx.w * vec3(1.0, 0.78, 0.35) * 0.6 * (0.5 + 0.5 * sin(uFigTime * 6.0 + vViewPosition.y * 40.0));',
+      FIG_RIM_GLSL,
+    );
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', [
-        '#include <common>',
-        'varying vec4 vFigCol;',
-        'varying vec4 vFigPbr;',
-        'varying vec4 vFigInst;',
-        'uniform float uFigTime;',
-        kind === 'base' ? 'varying vec4 vFigBaseCat;\nvarying vec3 vFigLocal;\nuniform sampler2D uFigAtlas;' : '',
-      ].join('\n'))
+      .replace('#include <common>', ['#include <common>', ...fHead].join('\n'))
       .replace('#include <color_fragment>', [
         '#include <color_fragment>',
         /* clamp: with MSAA the varyings are extrapolated at triangle edges, and pow() of a negative base gives NaN, which
@@ -760,51 +1037,38 @@ function figPatchMaterial(mat, kind) {
         'vec3 figSrgb = clamp(vFigCol.rgb, 0.0, 1.0);',
         'vec3 figLin = mix(figSrgb / 12.92, pow((figSrgb + 0.055) / 1.055, vec3(2.4)), step(0.04045, figSrgb));',
         'float figPa = vFigPbr.a * 255.0;',
-        kind === 'base'
-          ? [
-            'float figRing = step(0.9, vFigPbr.a);',
-            'float figMed = step(0.4, vFigPbr.a) * (1.0 - figRing);',
-            'float figSym = 0.0;',
-            'if (figMed > 0.5) {',
-            `  vec2 lu = vec2(vFigLocal.x / ${(2 * D.medR).toFixed(4)} + 0.5, (vFigLocal.y - ${D.medY.toFixed(4)}) / ${(2 * D.medR).toFixed(4)} + 0.5);`,
-            '  lu = clamp(lu, 0.02, 0.98);',
-            '  float cell = floor(vFigBaseCat.w + 0.5);',
-            '  vec2 au = vec2((mod(cell, 8.0) + lu.x) / 8.0, 1.0 - (floor(cell / 8.0) + 1.0) * 0.5 + lu.y * 0.5);',
-            '  figSym = smoothstep(0.35, 0.65, texture2D(uFigAtlas, au).r);',
-            '}',
-            'figLin = mix(figLin, vFigBaseCat.rgb, figRing);',
-            'figLin = mix(figLin, vec3(0.80, 0.56, 0.24), figSym);',
-          ].join('\n')
-          : '',
+        'float figIsBase = 0.0;',
+        'float figRing = 0.0;',
+        'float figMed = 0.0;',
+        'float figSym = 0.0;',
+        baseCode ? figBaseColorGlsl(gate) : '',
         kind === 'ghost' ? 'figLin = mix(figLin, vec3(0.62, 0.74, 1.0), 0.55);' : '',
         'diffuseColor.rgb *= figLin;',
       ].join('\n'))
       .replace('#include <roughnessmap_fragment>', [
         '#include <roughnessmap_fragment>',
         'roughnessFactor = max(vFigPbr.x, 0.04);',
-        kind === 'base' ? 'roughnessFactor = mix(roughnessFactor, 0.22, figSym);' : '',
+        baseCode ? 'roughnessFactor = mix(roughnessFactor, 0.22, figSym);' : '',
       ].join('\n'))
       .replace('#include <metalnessmap_fragment>', [
         '#include <metalnessmap_fragment>',
         'metalnessFactor = vFigPbr.y;',
-        kind === 'base' ? 'metalnessFactor = mix(metalnessFactor, 1.0, figSym);' : '',
+        baseCode ? 'metalnessFactor = mix(metalnessFactor, 1.0, figSym);' : '',
       ].join('\n'))
       .replace('#include <normal_fragment_maps>', [
         '#include <normal_fragment_maps>',
-        kind === 'base' ? 'if (figMed > 0.5) { vec2 g = vec2(dFdx(figSym), dFdy(figSym)); normal = normalize(normal - vec3(g * 1.4, 0.0)); }' : '',
+        baseCode ? 'if (figMed > 0.5) { vec2 g = vec2(dFdx(figSym), dFdy(figSym)); normal = normalize(normal - vec3(g * 1.4, 0.0)); }' : '',
       ].join('\n'))
       .replace('#include <lights_physical_fragment>', [
         '#include <lights_physical_fragment>',
         '#ifdef USE_CLEARCOAT',
-        kind === 'base' ? 'material.clearcoat = vFigPbr.z * (1.0 - figSym);' : 'material.clearcoat = vFigPbr.z;',
+        'material.clearcoat = vFigPbr.z * (1.0 - figSym);',
         '#endif',
       ].join('\n'))
       .replace('#include <aomap_fragment>', [
         '#include <aomap_fragment>',
         '{',
-        kind === 'base'
-          ? '  float bakedAo = 1.0;'
-          : '  float bakedAo = clamp(gl_FrontFacing ? vFigCol.a : min(figPa / 200.0, 1.0), 0.0, 1.0);',
+        '  float bakedAo = figIsBase > 0.5 ? 1.0 : clamp(gl_FrontFacing ? vFigCol.a : min(figPa / 200.0, 1.0), 0.0, 1.0);',
         '  reflectedLight.indirectDiffuse *= bakedAo;',
         '  float bakedNV = saturate(dot(geometryNormal, geometryViewDir));',
         '  reflectedLight.indirectSpecular *= computeSpecularOcclusion(bakedNV, bakedAo, material.roughness);',
@@ -820,16 +1084,7 @@ function figPatchMaterial(mat, kind) {
         '  #endif',
         '}',
       ].join('\n'))
-      .replace('#include <emissivemap_fragment>', [
-        '#include <emissivemap_fragment>',
-        /* bases: a gentle self-lit lift on the enamel band so dark category colours (Ravenclaw blue, Hallows black)
-           still read on the black lacquer at TV distance */
-        kind === 'base' ? 'totalEmissiveRadiance += vFigBaseCat.rgb * figRing * 0.45 + vec3(0.02) * figRing;' : 'totalEmissiveRadiance += figLin * max(figPa - 200.0, 0.0) / 55.0 * 2.2;',
-        kind === 'ghost' ? 'totalEmissiveRadiance += figLin * 0.22;' : '',
-        'totalEmissiveRadiance += vFigInst.y * vec3(1.0, 0.82, 0.45) * 0.55 + vFigInst.z * vec3(1.2);',
-        'totalEmissiveRadiance += vFigInst.w * vec3(1.0, 0.78, 0.35) * 0.6 * (0.5 + 0.5 * sin(uFigTime * 6.0 + vViewPosition.y * 40.0));',
-        FIG_RIM_GLSL,
-      ].join('\n'));
+      .replace('#include <emissivemap_fragment>', ['#include <emissivemap_fragment>', ...emissive].join('\n'));
     if (kind === 'ghost') {
       sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>', [
         '#include <opaque_fragment>',
@@ -841,30 +1096,272 @@ function figPatchMaterial(mat, kind) {
       ].join('\n'));
     }
   };
-  mat.customProgramCacheKey = () => `fig-packed-${kind}-v2`;
+  mat.customProgramCacheKey = () => `fig-packed-${kind}${batch ? '-batch' : ''}-v3`;
   return mat;
 }
 
-function figMakeMaterial(kind, physical) {
-  /* Figures are double-sided: robes, sleeves and cloaks are open cloth sheets with their own back-face AO */
-  const common = { roughness: 0.5, metalness: 0, envMapIntensity: 1.0, side: kind === 'figure' ? THREE.DoubleSide : THREE.FrontSide };
+/**
+ * Region batches lit per vertex (integration, PERF-PLAN 2.2 GPU budgets). A batched figurine is drawn at the mid or far
+ * LOD only while it is below the full-detail height (Xbox 200 px), so its 600-2600 triangles cover 1-5 px each; the
+ * per-pixel physical shading of those micro-triangles (quad overshading, IBL lookups) was about half of the figure GPU
+ * time on the UHD 630 proxy. The same lighting (three's physical BRDF, point / spot / directional / hemisphere lights,
+ * the PMREM, F's baked AO, the matt and emissive terms) is evaluated at the vertices; the fragment shader applies tone
+ * mapping, colour space and fog, and keeps the medallion symbol of the mid base per pixel (the field and the gold
+ * symbol are both lit at the vertex and the atlas mask mixes them). three's per-pixel specular anti-aliasing
+ * (geometryRoughness, from normal derivatives) is estimated as the vertex curvature (figBatchCurvature) times the
+ * world size of a pixel at the vertex. Large figurines (FIG_TIER ppMid / ppFar px) are drawn by the per-pixel twin
+ * instead (figPatchPerPixelTwin), where per-vertex highlights and mirror reflections would show. No shadows: the
+ * tiers that use it (Közepes, Mentő) have no shadow casters; the others draw every batched figurine per pixel.
+ */
+const FIG_VLIT_VERT_HEAD = [
+  'uniform vec3 diffuse;',
+  'uniform vec3 emissive;',
+  'uniform float uFigTime;',
+  'uniform float uFigPxH;',
+  'uniform float uFigGeoK;',
+  'varying vec3 vFigLit;',
+  'varying vec3 vFigLit2;',
+  'varying float vFigMed;',
+  '#include <lights_pars_begin>',
+  '#include <lights_physical_pars_fragment>',
+  '#include <cube_uv_reflection_fragment>',
+  '#include <envmap_common_pars_fragment>',
+  '#include <envmap_physical_pars_fragment>',
+  /* Outgoing radiance of one surface point (view space) without emissive: albedo (linear), roughness including the
+     geometry term, metalness, baked AO (1 = none) and the matt factor. */
+  'vec3 figVertexLight(vec3 albedo, float rough, float metal, float bakedAo, float matt, vec3 geometryPosition, vec3 geometryNormal, vec3 geometryViewDir) {',
+  '  PhysicalMaterial material;',
+  '  material.diffuseColor = albedo * (1.0 - metal);',
+  '  material.roughness = rough;',
+  '  material.specularColor = mix(vec3(0.04), albedo, metal);',
+  '  material.specularF90 = 1.0;',
+  '  ReflectedLight reflectedLight = ReflectedLight(vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));',
+  '  vec3 geometryClearcoatNormal = vec3(0.0);',
+  '  IncidentLight directLight;',
+  '  #if NUM_POINT_LIGHTS > 0',
+  '    PointLight pointLight;',
+  '    #pragma unroll_loop_start',
+  '    for ( int i = 0; i < NUM_POINT_LIGHTS; i ++ ) {',
+  '      pointLight = pointLights[ i ];',
+  '      getPointLightInfo( pointLight, geometryPosition, directLight );',
+  '      RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  '    }',
+  '    #pragma unroll_loop_end',
+  '  #endif',
+  '  #if NUM_SPOT_LIGHTS > 0',
+  '    SpotLight spotLight;',
+  '    #pragma unroll_loop_start',
+  '    for ( int i = 0; i < NUM_SPOT_LIGHTS; i ++ ) {',
+  '      spotLight = spotLights[ i ];',
+  '      getSpotLightInfo( spotLight, geometryPosition, directLight );',
+  '      RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  '    }',
+  '    #pragma unroll_loop_end',
+  '  #endif',
+  '  #if NUM_DIR_LIGHTS > 0',
+  '    DirectionalLight directionalLight;',
+  '    #pragma unroll_loop_start',
+  '    for ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {',
+  '      directionalLight = directionalLights[ i ];',
+  '      getDirectionalLightInfo( directionalLight, directLight );',
+  '      RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  '    }',
+  '    #pragma unroll_loop_end',
+  '  #endif',
+  '  vec3 irradiance = getAmbientLightIrradiance( ambientLightColor );',
+  '  #if NUM_HEMI_LIGHTS > 0',
+  '    #pragma unroll_loop_start',
+  '    for ( int i = 0; i < NUM_HEMI_LIGHTS; i ++ ) {',
+  '      irradiance += getHemisphereLightIrradiance( hemisphereLights[ i ], geometryNormal );',
+  '    }',
+  '    #pragma unroll_loop_end',
+  '  #endif',
+  '  vec3 iblIrradiance = vec3(0.0);',
+  '  vec3 radiance = vec3(0.0);',
+  '  #if defined( USE_ENVMAP ) && defined( ENVMAP_TYPE_CUBE_UV )',
+  '    iblIrradiance += getIBLIrradiance( geometryNormal );',
+  '    radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );',
+  '  #endif',
+  '  RE_IndirectDiffuse( irradiance, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  '  RE_IndirectSpecular( radiance, iblIrradiance, vec3(0.0), geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  // F's baked AO and matt terms (aomap_fragment of the per-pixel material; front faces only).
+  '  reflectedLight.indirectDiffuse *= bakedAo;',
+  '  float bakedNV = saturate(dot(geometryNormal, geometryViewDir));',
+  '  reflectedLight.indirectSpecular *= computeSpecularOcclusion(bakedNV, bakedAo, material.roughness);',
+  '  float bakedDirect = mix(1.0, bakedAo, 0.4);',
+  '  reflectedLight.directDiffuse *= bakedDirect;',
+  '  reflectedLight.directSpecular *= bakedDirect;',
+  '  reflectedLight.indirectSpecular *= mix(1.0, 0.2, matt);',
+  '  reflectedLight.directSpecular *= mix(1.0, 0.4, matt);',
+  '  return reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + reflectedLight.directSpecular + reflectedLight.indirectSpecular;',
+  '}',
+].join('\n');
+
+const FIG_VLIT_VERT_MAIN = [
+  '{',
+  '  vec3 figN = normalize(transformedNormal);',
+  '  vec3 figVd = normalize(-mvPosition.xyz);',
+  '  vec3 figSrgb = clamp(aCol.rgb, 0.0, 1.0);',
+  '  vec3 figLin = mix(figSrgb / 12.92, pow((figSrgb + 0.055) / 1.055, vec3(2.4)), step(0.04045, figSrgb));',
+  '  float figIsBase = float(figPart - (figPart / 2) * 2);',
+  '  float figRing = figIsBase * step(0.9, aPbr.a);',
+  '  float figMedV = figIsBase * step(0.4, aPbr.a) * (1.0 - figRing);',
+  '  vec4 figCat = figXfTexel(figHnd, 13);',
+  '  figLin = mix(figLin, figCat.rgb, figRing);',
+  '  float figPx = max(-mvPosition.z, 0.0) * 2.0 / (projectionMatrix[1][1] * max(uFigPxH, 1.0));',
+  // three's geometryRoughness (normal change per pixel) = the vertex curvature (aPbr.z, rad per metre / 4) x footprint.
+  '  float figGeoR = aPbr.z * 1020.0 * figPx * uFigGeoK;',
+  '  float figAo = figIsBase > 0.5 ? 1.0 : clamp(aCol.a, 0.0, 1.0);',
+  '  float figMatt = smoothstep(0.62, 0.9, aPbr.x);',
+  '  float figRough = min(max(max(aPbr.x, 0.04), 0.0525) + figGeoR, 1.0);',
+  '  vFigLit = figVertexLight(diffuse * figLin, figRough, aPbr.y, figAo, figMatt, mvPosition.xyz, figN, figVd);',
+  '  vFigMed = figMedV;',
+  '  vFigLit2 = vFigLit;',
+  // The medallion field also gets the gold symbol lit; the fragment shader mixes the two by the atlas mask.
+  '  if (figMedV > 0.5) vFigLit2 = figVertexLight(diffuse * vec3(0.80, 0.56, 0.24), min(0.2725 + figGeoR, 1.0), 1.0, 1.0, figMatt, mvPosition.xyz, figN, figVd);',
+  // Emissive terms (emissivemap_fragment of the per-pixel material).
+  '  vec3 figEm = emissive;',
+  '  if (figIsBase > 0.5) figEm += figCat.rgb * figRing * 0.45 + vec3(0.02) * figRing;',
+  '  else figEm += figLin * max(aPbr.a * 255.0 - 200.0, 0.0) / 55.0 * 2.2;',
+  '  vec4 figFx = vFigInst * mix(vec4(1.0), vec4(1.0, 0.5, 0.5, 0.0), figIsBase);',
+  '  figEm += figFx.y * vec3(1.0, 0.82, 0.45) * 0.55 + figFx.z * vec3(1.2);',
+  '  figEm += figFx.w * vec3(1.0, 0.78, 0.35) * 0.6 * (0.5 + 0.5 * sin(uFigTime * 6.0 - mvPosition.y * 40.0));',
+  '  if (figFx.x > 0.001) {',
+  '    float figRimF = 1.0 - clamp(abs(dot(figN, figVd)), 0.0, 1.0);',
+  '    float figRim2 = figRimF * figRimF;',
+  '    figEm += figFx.x * vec3(1.0, 0.74, 0.28) * (0.03 + 0.35 * figRim2 + 0.9 * figRim2 * figRim2);',
+  '  }',
+  '  vFigLit += figEm;',
+  '  vFigLit2 += figEm;',
+  '}',
+].join('\n');
+
+/** Fragment stage: the vertex light, the medallion symbol mask of the mid base (as figBaseColorGlsl), the frame chunks. */
+function figVlitFragMain() {
+  const D = FIG_BASE_DIM;
+  return [
+    'void main() {',
+    '  vec4 diffuseColor = vec4( 1.0 );',
+    '  vec3 outgoingLight = vFigLit;',
+    '  if (vFigMed > 0.5) {',
+    `    vec2 lu = vec2(vFigLocal.x / ${(2 * D.medR).toFixed(4)} + 0.5, (vFigLocal.y - ${D.medY.toFixed(4)}) / ${(2 * D.medR).toFixed(4)} + 0.5);`,
+    '    lu = clamp(lu, 0.02, 0.98);',
+    '    float cell = floor(vFigBaseCat.w + 0.5);',
+    '    vec2 au = vec2((mod(cell, 8.0) + lu.x) / 8.0, 1.0 - (floor(cell / 8.0) + 1.0) * 0.5 + lu.y * 0.5);',
+    '    float figSym = smoothstep(0.35, 0.65, texture2D(uFigAtlas, au).r);',
+    '    outgoingLight = mix(vFigLit, vFigLit2, figSym);',
+    '  }',
+    '  #include <opaque_fragment>',
+    '  #include <tonemapping_fragment>',
+    '  #include <colorspace_fragment>',
+    '  #include <fog_fragment>',
+    '  #include <premultiplied_alpha_fragment>',
+    '  #include <dithering_fragment>',
+    '}',
+  ].join('\n');
+}
+
+/**
+ * Turns a batch figure material (figPatchMaterial(mat, 'figure', true)) into the per-pixel twin of the per-vertex lit
+ * batches: it draws only the handles whose shading path (transform texel 14) is per pixel and collapses the others.
+ */
+function figPatchPerPixelTwin(mat) {
+  const inner = mat.onBeforeCompile;
+  mat.onBeforeCompile = (sh, renderer) => {
+    inner(sh, renderer);
+    // Members of the per-vertex draw leave right away (one texel fetch per collapsed vertex).
+    sh.vertexShader = sh.vertexShader.replace('mat4 figM = figXfMatrix(figHnd, figPart);', [
+      'if (figXfTexel(figHnd, 14).x < 0.5) { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); return; }',
+      'mat4 figM = figXfMatrix(figHnd, figPart);',
+    ].join('\n'));
+  };
+  mat.customProgramCacheKey = () => 'fig-packed-figure-batch-pp-v2';
+  return mat;
+}
+
+/**
+ * Turns a batch figure material (figPatchMaterial(mat, 'figure', true)) into the per-vertex lit batch variant. The
+ * PMREM defines that three only gives the fragment stage are added to the vertex stage from the program parameters
+ * (envMapCubeUVHeight), exactly as three computes them.
+ */
+function figPatchVertexLit(mat) {
+  const inner = mat.onBeforeCompile;
+  mat.onBeforeCompile = (sh, renderer) => {
+    inner(sh, renderer);
+    sh.uniforms.uFigPxH = FIG_UNIFORMS.pxH;
+    sh.uniforms.uFigGeoK = FIG_UNIFORMS.geoK;
+    let defs = '';
+    const h = sh.envMap ? sh.envMapCubeUVHeight : null;
+    if (h) {
+      const maxMip = Math.log2(h) - 2;
+      const texelWidth = 1.0 / (3 * Math.max(Math.pow(2, maxMip), 7 * 16));
+      defs = ['#define ENVMAP_TYPE_CUBE_UV', `#define CUBEUV_TEXEL_WIDTH ${texelWidth}`, `#define CUBEUV_TEXEL_HEIGHT ${1.0 / h}`, `#define CUBEUV_MAX_MIP ${maxMip}.0`].join('\n');
+    }
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `${defs}\n#include <common>\n${FIG_VLIT_VERT_HEAD}`)
+      // Members of the per-pixel twin leave right away (one texel fetch per collapsed vertex).
+      .replace('mat4 figM = figXfMatrix(figHnd, figPart);', [
+        'if (figXfTexel(figHnd, 14).x > 0.5) { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); return; }',
+        'mat4 figM = figXfMatrix(figHnd, figPart);',
+      ].join('\n'))
+      .replace('#include <fog_vertex>', `#include <fog_vertex>\n${FIG_VLIT_VERT_MAIN}`);
+    const at = sh.fragmentShader.indexOf('void main() {');
+    sh.fragmentShader = sh.fragmentShader.slice(0, at).replace('#include <common>', '#include <common>\nvarying vec3 vFigLit;\nvarying vec3 vFigLit2;\nvarying float vFigMed;')
+      + figVlitFragMain();
+  };
+  mat.customProgramCacheKey = () => 'fig-packed-figure-batch-vlit-v5';
+  return mat;
+}
+
+/** Before each per-vertex lit batch draw: the pixel height of the target (dynamic resolution, composer target). */
+function figVlitBeforeRender(renderer) {
+  const rt = renderer.getRenderTarget();
+  FIG_UNIFORMS.pxH.value = rt ? rt.height : renderer.getContext().drawingBufferHeight;
+}
+
+/**
+ * kind: 'figure' | 'ghost' | 'base'; side: THREE.DoubleSide only for the full-detail figure (robes, sleeves and cloaks
+ * are open cloth sheets with their own back-face AO; the mid and far LODs are closed enough for front faces only).
+ */
+function figMakeMaterial(kind, physical, side = THREE.FrontSide, batch = false, name = '') {
+  const common = { roughness: 0.5, metalness: 0, envMapIntensity: 1.0, side };
   let m;
   if (kind === 'ghost') m = new THREE.MeshStandardMaterial({ ...common, transparent: true, depthWrite: true });
   else if (physical) m = new THREE.MeshPhysicalMaterial({ ...common, clearcoat: 1, clearcoatRoughness: 0.12 });
   else m = new THREE.MeshStandardMaterial(common);
-  return figPatchMaterial(m, kind);
+  m.name = name;
+  return figPatchMaterial(m, kind, batch);
 }
 
 /**
  * Depth-only pre-pass for translucent figures (ghosts, the cloak): drawn just before the ghost colour pass (both in
  * the transparent list), so only the frontmost ghost surface is shaded and inner faces no longer shine through as
- * hard-edged shards.
+ * hard-edged shards. `batch`: the region-batch variant (transform texture).
  */
-function figGhostDepthMaterial() {
-  if (!FIG_MATERIALS.ghostDepth) {
-    FIG_MATERIALS.ghostDepth = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, transparent: true, side: THREE.FrontSide });
+function figGhostDepthMaterial(batch = false) {
+  const key = batch ? 'ghostDepthBatch' : 'ghostDepth';
+  if (!FIG_MATERIALS[key]) {
+    const m = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, transparent: true, side: THREE.FrontSide });
+    m.name = `fig:${key}`;
+    if (batch) {
+      m.onBeforeCompile = (sh) => {
+        sh.uniforms.uFigXf = FIG_UNIFORMS.xf;
+        sh.uniforms.uFigBaseQMin = FIG_UNIFORMS.baseQMin;
+        sh.uniforms.uFigBaseQSize = FIG_UNIFORMS.baseQSize;
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <common>', `#include <common>\n${FIG_BATCH_VERT_HEAD}`)
+          .replace('#include <begin_vertex>', [
+            'int figId = int(aHid * 65535.0 + 0.5);',
+            'int figHnd = figId / 4;',
+            'mat4 figM = figXfMatrix(figHnd, figId - figHnd * 4);',
+            'vec3 transformed = (figM * vec4(position, 1.0)).xyz;',
+          ].join('\n'));
+      };
+      m.customProgramCacheKey = () => 'fig-ghost-depth-batch-v1';
+    }
+    FIG_MATERIALS[key] = m;
   }
-  return FIG_MATERIALS.ghostDepth;
+  return FIG_MATERIALS[key];
 }
 
 /**
@@ -908,31 +1405,63 @@ function figOutlineMaterial() {
       ].join('\n'),
       side: THREE.BackSide, transparent: true, depthWrite: false, depthTest: true, fog: false, toneMapped: false,
     });
+    FIG_MATERIALS.outline.name = 'fig:outline';
   }
   return FIG_MATERIALS.outline;
 }
 
-/** DESIGN.md 16.5: creates the shared materials once. Keys: figure, figureKit, glass, glassKit, base. */
+/**
+ * DESIGN.md 16.5: creates the shared materials once and applies the tier (PERF-PLAN 2.1 ids or the legacy preset
+ * names). Keys: figure (= figure0), figureKit, figureLod, figureBatch (unused since the two-draw batches),
+ * figureBatchVlit / figureBatchPP (the two draws of an opaque region batch: per vertex for small figurines below Magas,
+ * per pixel for large ones; figureBatchVlitOn), glass, glassKit, glassBatch, base (= base0), baseLod.
+ */
 function initFigureMaterials(opts = { quality: 'magas' }) {
   if (!FIG_MATERIALS.figurePhys) {
-    FIG_MATERIALS.figurePhys = figMakeMaterial('figure', true);
-    FIG_MATERIALS.figureStd = figMakeMaterial('figure', false);
-    FIG_MATERIALS.basePhys = figMakeMaterial('base', true);
-    FIG_MATERIALS.baseStd = figMakeMaterial('base', false);
-    FIG_MATERIALS.glass = figMakeMaterial('ghost', false);
+    FIG_MATERIALS.figurePhys = figMakeMaterial('figure', true, THREE.DoubleSide, false, 'fig:figure0-phys');
+    FIG_MATERIALS.figureStd = figMakeMaterial('figure', false, THREE.DoubleSide, false, 'fig:figure0-std');
+    FIG_MATERIALS.figureLod = figMakeMaterial('figure', false, THREE.FrontSide, false, 'fig:figure-lod');
+    FIG_MATERIALS.figureBatch = figMakeMaterial('figure', false, THREE.FrontSide, true, 'fig:figure-batch');
+    FIG_MATERIALS.figureBatchVlit = figPatchVertexLit(figMakeMaterial('figure', false, THREE.FrontSide, true, 'fig:figure-batch-vlit'));
+    FIG_MATERIALS.figureBatchPP = figPatchPerPixelTwin(figMakeMaterial('figure', false, THREE.FrontSide, true, 'fig:figure-batch-pp'));
+    FIG_MATERIALS.basePhys = figMakeMaterial('base', true, THREE.FrontSide, false, 'fig:base0-phys');
+    FIG_MATERIALS.baseStd = figMakeMaterial('base', false, THREE.FrontSide, false, 'fig:base-std');
+    FIG_MATERIALS.glass = figMakeMaterial('ghost', false, THREE.FrontSide, false, 'fig:glass');
+    FIG_MATERIALS.glassBatch = figMakeMaterial('ghost', false, THREE.FrontSide, true, 'fig:glass-batch');
     FIG_MATERIALS.glassKit = FIG_MATERIALS.glass;
+    FIG_MATERIALS.envMap = null;
   }
-  figApplyQuality(opts.quality || FIG_MATERIALS.quality || 'magas');
+  figApplyQuality((opts && opts.quality) || FIG_MATERIALS.quality || 'magas');
   return FIG_MATERIALS;
 }
 
-/** 'xbox' uses MeshStandardMaterial (no clearcoat lobe); 'magas' the physical clearcoat version. */
+/** Clearcoat (Physical) only on the Magas tier and only for the full-detail figure and base (PERF-PLAN F8). */
 function figApplyQuality(q) {
-  const phys = q !== 'xbox';
-  FIG_MATERIALS.quality = q;
+  const tier = figTierId(q);
+  const phys = tier === 'magas';
+  FIG_MATERIALS.quality = tier;
   FIG_MATERIALS.figure = phys ? FIG_MATERIALS.figurePhys : FIG_MATERIALS.figureStd;
+  FIG_MATERIALS.figure0 = FIG_MATERIALS.figure;
   FIG_MATERIALS.figureKit = FIG_MATERIALS.figure;
   FIG_MATERIALS.base = phys ? FIG_MATERIALS.basePhys : FIG_MATERIALS.baseStd;
+  FIG_MATERIALS.base0 = FIG_MATERIALS.base;
+  FIG_MATERIALS.baseLod = FIG_MATERIALS.baseStd;
+  // Opaque region batches: small figurines lit per vertex where the tier asks for it (FIG_TIER ppMid / ppFar); the
+  // per-pixel twin draws the others.
+  FIG_MATERIALS.figureBatchVlitOn = typeof FIG_TIER !== 'undefined' && FIG_TIER[tier] ? FIG_TIER[tier].ppMid > 0 : false;
+  for (const s of figSnitchList) s.setQuality(tier);
+}
+
+/** Image-based lighting for the figure, base and glass materials (W passes the tier's PMREM or null). */
+function figSetEnvMap(tex) {
+  const t = tex || null;
+  FIG_MATERIALS.envMap = t;
+  for (const k of ['figurePhys', 'figureStd', 'figureLod', 'figureBatch', 'figureBatchVlit', 'figureBatchPP', 'basePhys', 'baseStd', 'glass', 'glassBatch']) {
+    const m = FIG_MATERIALS[k];
+    if (!m || m.envMap === t) continue;
+    m.envMap = t;
+    m.needsUpdate = true;
+  }
 }
 
 /** Packs a palette material table into the aPbr bytes (glow wins over back-face AO). */
@@ -945,18 +1474,22 @@ function figPbrByte(m, back) {
 /* ==== 24-figures-kit.js — figure rendering: the LOD kit for every figurine in the game, the single-design instancer,
    external (artist-made) model support and the free-flying Snitch.
 
-   Rendering per frame (DECISIONS.md 5):
-   - every visible handle gets a LOD by camera distance (with hysteresis, scaled by figure size and quality preset);
-   - near and mid instances are CPU frustum-culled and written into one InstancedMesh per design and LOD (draw calls =
-     designs in view), plus one base InstancedMesh per LOD;
-   - far instances (and their bases) live in one CPU-transformed batch mesh (1 draw, 2 with ghosts): a handle's slot is
-     rewritten only when it enters the far range or moves while far;
-   - the aim highlight (setRim) is a per-instance rim glow in figInst.x; a highlighted handle never drops to the far
-     batch, so its glow is always drawn. ==== */
+   Rendering per frame (DECISIONS.md 5, PERF-PLAN.md 2.4 and F1-F11):
+   - every visible handle gets a LOD from its projected height in pixels (zoom included, hysteresis, tier table and
+     governor detail level in 27-figures-perf.js); covered pile figurines are capped (the gameplay passes the depth);
+   - static handles (pose unchanged for a few frames: settled pile figurines, seated shelf figurines, figurines on the
+     floor) are drawn at the mid or far LOD by region batches: one mesh per pile sector, shelf section, tower or floor
+     cell with a real bounding sphere, rebuilt time-sliced when its members or their LOD class change. A batch takes
+     the world transform and the effects of each member from the per-handle transform texture, so a member that is
+     promoted (full detail, aimed, picked up) is collapsed there at once without touching the batch;
+   - everything else (full detail, moving, aimed, held, members whose batch is not rebuilt yet) is CPU frustum-culled
+     and drawn by one InstancedMesh per design and LOD plus one base InstancedMesh per LOD;
+   - the aim highlight (setRim) is a per-instance rim glow in figInst.x plus an outline hull (mid LOD, 2 draws). ==== */
 
 const figM1 = new THREE.Matrix4();
 const figM2 = new THREE.Matrix4();
 const figM3 = new THREE.Matrix4();
+const figM4 = new THREE.Matrix4();
 const figV1 = new THREE.Vector3();
 const figV2 = new THREE.Vector3();
 const figS1 = new THREE.Vector3();
@@ -965,11 +1498,15 @@ const figPS = new THREE.Matrix4();
 const figFrustum = new THREE.Frustum();
 const figSphere = new THREE.Sphere();
 const figCol1 = new THREE.Color();
+/** Attributes an instanced geometry shares with its design LOD geometry (never disposed with it). */
+const FIG_SHARED_ATTRS = ['position', 'aOct', 'aCol', 'aPbr'];
+/** Snitch flyers alive (their gold switches between Physical and Standard with the tier). */
+const figSnitchList = [];
 
 /** Geometry for one InstancedMesh: shares the packed attributes of `src` and adds its own instance attributes. */
 function figInstGeometry(src, attrs) {
   const g = new THREE.BufferGeometry();
-  for (const k of ['position', 'aOct', 'aCol', 'aPbr']) g.setAttribute(k, src.attributes[k]);
+  for (const k of FIG_SHARED_ATTRS) g.setAttribute(k, src.attributes[k]);
   g.setIndex(src.index);
   for (const k of Object.keys(attrs)) g.setAttribute(k, attrs[k]);
   g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e4);
@@ -979,12 +1516,14 @@ function figInstGeometry(src, attrs) {
 function figInstAttr(cap, size) {
   const a = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, cap) * size), size);
   a.setUsage(THREE.DynamicDrawUsage);
+  a.onUpload(figMarkUploaded);
   return a;
 }
 
 function figInstanced(geo, mat, cap) {
   const m = new THREE.InstancedMesh(geo, mat, Math.max(1, cap));
   m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  m.instanceMatrix.onUpload(figMarkUploaded);
   m.count = 0;
   m.frustumCulled = false;
   m.castShadow = false;
@@ -993,12 +1532,13 @@ function figInstanced(geo, mat, cap) {
   return m;
 }
 
-/** Marks the first `n` instances of an attribute for upload (only the used range goes to the GPU). */
+/** Marks the first `n` instances of an attribute for upload (only the used range goes to the GPU). Returns bytes. */
 function figUpload(attr, n, itemSize) {
-  if (n <= 0) return;
+  if (n <= 0) return 0;
   attr.clearUpdateRanges();
   attr.addUpdateRange(0, n * itemSize);
   attr.needsUpdate = true;
+  return n * itemSize * 4;
 }
 
 /** Local matrix of a design LOD: lift onto the base, cm -> m, dequantisation. */
@@ -1009,162 +1549,46 @@ function figLocalMatrix(entry, baseH, out = new THREE.Matrix4()) {
   return out;
 }
 
-/* ---- far batch ----------------------------------------------------------------------------------- */
-
 /**
- * One non-instanced mesh holding the far LOD of many handles. slots: [{ h, parts: [{ src: far data, local: Matrix4,
- * ring: [r, g, b] | null }] }]. Each slot is written (transformed) or collapsed independently.
+ * Instanced geometry source of the far LOD: float positions in cm (no dequantisation), so the instanced normals are the
+ * true ones, exactly as the far LOD was always drawn.
  */
-function figCreateFarBatch(material, slots, n) {
-  let nv = 0;
-  let ni = 0;
-  for (const s of slots) {
-    s.start = nv;
-    for (const p of s.parts) {
-      p.start = nv;
-      nv += p.src.pos.length / 3;
-      ni += p.src.index.length;
-    }
-    s.count = nv - s.start;
+function figFarInstGeometry(e) {
+  if (e.farGeo) return e.farGeo;
+  const p = e.geometry.attributes.position;
+  if (!p.normalized) {
+    e.farGeo = e.geometry;
+    return e.farGeo;
   }
-  const pos = new Float32Array(Math.max(3, nv * 3));
-  const oct = new Int16Array(Math.max(2, nv * 2));
-  const col = new Uint8Array(Math.max(4, nv * 4));
-  const pbr = new Uint8Array(Math.max(4, nv * 4));
-  const fx = new Uint8Array(Math.max(4, nv * 4));
-  const index = nv < 65536 ? new Uint16Array(Math.max(3, ni)) : new Uint32Array(Math.max(3, ni));
-  let io = 0;
-  for (const s of slots) {
-    for (const p of s.parts) {
-      const src = p.src;
-      const cnt = src.pos.length / 3;
-      col.set(src.col.subarray(0, cnt * 4), p.start * 4);
-      pbr.set(src.pbr.subarray(0, cnt * 4), p.start * 4);
-      if (p.ring) {
-        /* Base: enamel band in the category colour, flags cleared (the figure shader would read them as glow) */
-        for (let v = 0; v < cnt; v++) {
-          const o = (p.start + v) * 4;
-          if (src.pbr[v * 4 + 3] === 255) {
-            col[o] = p.ring[0];
-            col[o + 1] = p.ring[1];
-            col[o + 2] = p.ring[2];
-          }
-          pbr[o + 3] = 200;
-        }
-      }
-      for (let i = 0; i < src.index.length; i++) index[io++] = src.index[i] + p.start;
-    }
-  }
+  const far = e.far || figFloatCopy(e);
   const g = new THREE.BufferGeometry();
-  const aPos = new THREE.BufferAttribute(pos, 3);
-  const aOct = new THREE.BufferAttribute(oct, 2, true);
-  const aFx = new THREE.BufferAttribute(fx, 4, true);
-  for (const a of [aPos, aOct, aFx]) a.setUsage(THREE.DynamicDrawUsage);
-  g.setAttribute('position', aPos);
-  g.setAttribute('aOct', aOct);
-  g.setAttribute('aCol', new THREE.BufferAttribute(col, 4, true));
-  g.setAttribute('aPbr', new THREE.BufferAttribute(pbr, 4, true));
-  g.setAttribute('figInst', aFx);
-  g.setIndex(new THREE.BufferAttribute(index, 1));
-  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e4);
-  const mesh = new THREE.Mesh(g, material);
-  mesh.frustumCulled = false;
-  mesh.matrixAutoUpdate = false;
-  mesh.receiveShadow = true;
-  const slotOf = new Int32Array(n).fill(-1);
-  slots.forEach((s, i) => {
-    slotOf[s.h] = i;
-  });
-  const dirty = [];
-  const on = new Uint8Array(slots.length);
-  const batch = {
-    mesh, slots, slotOf, tris: io / 3, verts: nv, liveTris: 0,
-    has(h) {
-      return slotOf[h] >= 0;
-    },
-    /** Writes handle h with world matrix hm (pose space -> world) and fx bytes; noBase collapses its base part. */
-    write(h, hm, glow, flash, shimmer, noBase = false) {
-      const si = slotOf[h];
-      if (si < 0) return;
-      const s = slots[si];
-      for (const p of s.parts) {
-        if (noBase && p.ring) {
-          pos.fill(0, p.start * 3, (p.start + p.src.pos.length / 3) * 3);
-          continue;
-        }
-        figM1.multiplyMatrices(hm, p.local);
-        const e = figM1.elements;
-        const src = p.src;
-        const cnt = src.pos.length / 3;
-        for (let v = 0; v < cnt; v++) {
-          const x = src.pos[v * 3];
-          const y = src.pos[v * 3 + 1];
-          const z = src.pos[v * 3 + 2];
-          const o = (p.start + v) * 3;
-          pos[o] = e[0] * x + e[4] * y + e[8] * z + e[12];
-          pos[o + 1] = e[1] * x + e[5] * y + e[9] * z + e[13];
-          pos[o + 2] = e[2] * x + e[6] * y + e[10] * z + e[14];
-          const nx = src.nrm[v * 3];
-          const ny = src.nrm[v * 3 + 1];
-          const nz = src.nrm[v * 3 + 2];
-          figOctEncode(e[0] * nx + e[4] * ny + e[8] * nz, e[1] * nx + e[5] * ny + e[9] * nz, e[2] * nx + e[6] * ny + e[10] * nz, oct, (p.start + v) * 2);
-        }
-      }
-      const g8 = Math.round(glow * 255);
-      const f8 = Math.round(flash * 255);
-      const s8 = Math.round(shimmer * 255);
-      for (let v = s.start; v < s.start + s.count; v++) {
-        fx[v * 4 + 1] = g8;
-        fx[v * 4 + 2] = f8;
-        fx[v * 4 + 3] = s8;
-      }
-      if (!on[si]) batch.liveTris += s.tris || 0;
-      on[si] = 1;
-      dirty.push(si);
-    },
-    collapse(h) {
-      const si = slotOf[h];
-      if (si < 0 || !on[si]) return;
-      const s = slots[si];
-      pos.fill(0, s.start * 3, (s.start + s.count) * 3);
-      on[si] = 0;
-      batch.liveTris -= s.tris || 0;
-      dirty.push(si);
-    },
-    isOn(h) {
-      const si = slotOf[h];
-      return si >= 0 && on[si] === 1;
-    },
-    flush() {
-      if (!dirty.length) return;
-      if (dirty.length > slots.length * 0.3) {
-        for (const a of [aPos, aOct, aFx]) {
-          a.clearUpdateRanges();
-          a.needsUpdate = true;
-        }
-      } else {
-        for (const si of dirty) {
-          const s = slots[si];
-          aPos.addUpdateRange(s.start * 3, s.count * 3);
-          aOct.addUpdateRange(s.start * 2, s.count * 2);
-          aFx.addUpdateRange(s.start * 4, s.count * 4);
-        }
-        aPos.needsUpdate = true;
-        aOct.needsUpdate = true;
-        aFx.needsUpdate = true;
-      }
-      dirty.length = 0;
-    },
-    dispose() {
-      g.dispose();
-    },
-  };
-  for (const s of slots) {
-    let t = 0;
-    for (const p of s.parts) t += p.src.index.length / 3;
-    s.tris = t;
+  g.setAttribute('position', new THREE.BufferAttribute(far.pos, 3).onUpload(figMarkUploaded));
+  for (const k of ['aOct', 'aCol', 'aPbr']) g.setAttribute(k, e.geometry.attributes[k]);
+  g.setIndex(e.geometry.index);
+  e.farGeo = g;
+  return g;
+}
+
+/** A degenerate one-triangle geometry in the packed layout (program warm-up only). */
+function figWarmGeometry(batch) {
+  const g = new THREE.BufferGeometry();
+  // The figures' vertex layout (u16x4 position, figPackedGeometry), so the warm-up draw builds the same input layout.
+  g.setAttribute('position', new THREE.BufferAttribute(new Uint16Array(12), 4, true));
+  g.setAttribute('aOct', new THREE.BufferAttribute(new Int16Array(6), 2, true));
+  g.setAttribute('aCol', new THREE.BufferAttribute(new Uint8Array(12), 4, true));
+  g.setAttribute('aPbr', new THREE.BufferAttribute(new Uint8Array(12), 4, true));
+  g.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+  if (batch) {
+    // The region batches' vertex record (figBatchGeometry): interleaved u16x4 position + handle id.
+    const ib = new THREE.InterleavedBuffer(new Uint16Array(12), 4);
+    g.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 4, 0, true));
+    g.setAttribute('aHid', new THREE.InterleavedBufferAttribute(ib, 1, 3, true));
+  } else {
+    g.setAttribute('figInst', figInstAttr(1, 4));
+    g.setAttribute('figBaseCat', figInstAttr(1, 4));
   }
-  return batch;
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e4);
+  return g;
 }
 
 /* ---- external material patch (glow / flash / shimmer on artist-made models) -------------------------- */
@@ -1190,13 +1614,15 @@ function figPatchExternal(mat) {
 
 /**
  * DESIGN.md 16.5 high-level renderer. designOf[h] = design id of handle h. Every handle starts HIDDEN.
- * opts: { quality: 'xbox' | 'magas' }. Extras beyond the design API: setCamera(camera), update(t, camera),
- * registerExternalFigure(designId, { meshesByMaterial }), whenLoaded().
+ * opts: { quality: tier id (PERF-PLAN 2.1) or legacy 'xbox' | 'magas', deferBatches }. Extras beyond the design API
+ * (PERF-PLAN 5.2): setCamera, update(t, camera), setQuality, setDetailLevel, setViewport, setEnvMap, buildDeferred,
+ * setWarmup, warmupObjects, onContextRestored, setCover, setFocus, registerExternalFigure, whenLoaded, gpuMemory.
  */
 function createFigureKit(scene, designOf, opts = {}) {
   initFigureMaterials(opts);
   figStartLoading();
   const n = designOf.length;
+  const keepCpu = figKeepCpu();
   const recs = [];
   const recById = {};
   const designIdx = new Int16Array(n);
@@ -1209,20 +1635,28 @@ function createFigureKit(scene, designOf, opts = {}) {
       const cat = FIG_CATEGORIES[FIG_CATEGORY_INDEX[d.category]];
       const catHex = cat ? cat.color : (d.house ? FIG_CATEGORIES[FIG_CATEGORY_INDEX[d.house]].color : '#8e8169');
       figCol1.set(catHex);
-      const srgb = [Math.round(figCol1.r * 255), Math.round(figCol1.g * 255), Math.round(figCol1.b * 255)];
       figCol1.convertSRGBToLinear();
       r = recById[id] = {
-        id, d, met: getFigureMetrics(id), ghost: !!d.translucent, handles: [], index: recs.length, meshes: [null, null], cnt: [0, 0],
-        sig: [0, 0], prevSig: [0, 0], dirty: [0, 0], force: [1, 1],
-        local: [new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4()], ext: null, catIndex: cat ? cat.index : 0,
-        ringLin: [figCol1.r, figCol1.g, figCol1.b], ringSrgb: srgb, hasBase: !d.ownBase, baseScale: d.ownBase ? 1 : d.baseR / 30,
+        id, d, met: getFigureMetrics(id), ghost: !!d.translucent, handles: [], index: recs.length, meshes: [null, null, null],
+        depth: null, cnt: [0, 0, 0], sig: [0, 0, 0], prevSig: [0, 0, 0], dirty: [0, 0, 0], fxd: [0, 0, 0], force: [1, 1, 1], tris: [0, 0, 0],
+        local: [new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4()], qlocal: [null, new THREE.Matrix4(), new THREE.Matrix4()],
+        bsrc: [null, null, null], gen: 0, ext: null, catIndex: cat ? cat.index : 0,
+        ringLin: [figCol1.r, figCol1.g, figCol1.b], hasBase: !d.ownBase, baseScale: d.ownBase ? 1 : d.baseR / 30,
       };
       recs.push(r);
     }
     designIdx[h] = r.index;
     r.handles.push(h);
   }
-  const quality = { q: opts.quality || 'magas', dist: opts.quality === 'xbox' ? 1 : 1.3, zoom: 1 };
+
+  /* Tier, governor detail level, viewport and the adaptive triangle-budget factor */
+  let tier = figTierId(opts.quality);
+  let T = FIG_TIER[tier];
+  let detail = 0;
+  let viewH = 0;
+  let adapt = 1;
+
+  /* Per-handle state */
   const mode = new Uint8Array(n);
   const hm = new Float32Array(n * 16);
   const pos = new Float32Array(n * 3);
@@ -1231,38 +1665,89 @@ function createFigureKit(scene, designOf, opts = {}) {
   const poseDirty = new Uint8Array(n).fill(1);
   const fx = new Float32Array(n * 2);
   const rim = new Float32Array(n);
-  const fxDirty = new Uint8Array(n);
+  const fxDirty = new Uint8Array(n).fill(1);
   const baseOn = new Uint8Array(n).fill(1);
   const lod = new Int8Array(n).fill(-1);
+  const fin = new Int8Array(n).fill(-1);
+  const chunkOk = new Uint8Array(n);
   const center = new Float32Array(n * 4);
+  const still = new Uint8Array(n);
+  const dyn = new Uint16Array(n);
+  const cover = new Uint8Array(n);
+  const focus = new Uint8Array(n);
+  const dist = new Float32Array(n);
+  const regOk = new Uint8Array(n);
+  const wantBase = new Uint8Array(n);
+  const drawF = new Uint8Array(n);
+  const drawB = new Uint8Array(n);
+  const xfState = new Uint8Array(n);
+  const xfDirty = new Uint8Array(n).fill(1);
+  /* Shading path of a batched handle (transform texel 14: 1 = per-pixel twin draw) and its last pixel height */
+  const shadePP = new Uint8Array(n);
+  const hpxA = new Float32Array(n);
+  /* A two-deep covered pile figurine shown at LOD1 because it is large on screen (hysteresis state, FIG_PERF.cover2Up) */
+  const c2up = new Uint8Array(n);
+  /* Per handle and batch kind (FIG_KIND_*): region chunk, wanted chunk this frame, built chunk, its part, base flag */
+  const reg = new Int32Array(n * 4).fill(-1);
+  const want = new Int32Array(n * 4).fill(-1);
+  const mem = new Int32Array(n * 4).fill(-1);
+  const memPart = new Int16Array(n * 4);
+  const memBase = new Uint8Array(n * 4);
+  const nextE = new Int32Array(n * 4).fill(-1);
+  const cand0 = new Float64Array(n);
+  const cand1 = new Float64Array(n);
   const shimmer = new Float32Array(FIG_CATEGORIES.length);
   const shimmerPrev = new Float32Array(FIG_CATEGORIES.length);
-  for (let h = 0; h < n; h++) {
-    quat[h * 4 + 3] = 1;
-  }
+  for (let h = 0; h < n; h++) quat[h * 4 + 3] = 1;
   const meshes = [];
   const group = new THREE.Group();
   group.name = 'figures';
   group.matrixAutoUpdate = false;
   scene.add(group);
 
-  function figMat(r) {
-    return r.ghost ? FIG_MATERIALS.glass : FIG_MATERIALS.figure;
+  /* Transform / effect texture of the region batches; the category texel never changes */
+  const xf = figCreateXf(n);
+  FIG_UNIFORMS.xf.value = xf.tex;
+  for (let h = 0; h < n; h++) {
+    const r = recs[designIdx[h]];
+    xf.cat(h, r.ringLin[0], r.ringLin[1], r.ringLin[2], r.catIndex);
+  }
+
+  /* Batch sources of the bases (mid and far); the medallion lookup needs the mid base's quantisation box */
+  const baseSrc = [null, figBatchSource(figBuildBase(1), false), figBatchSource(figBuildBase(2), false)];
+  {
+    const e = baseSrc[1].D.elements;
+    FIG_UNIFORMS.baseQMin.value.set(e[12], e[13], e[14]);
+    FIG_UNIFORMS.baseQSize.value.set(e[0], e[5], e[10]);
+  }
+
+  function figMatFor(r, l) {
+    if (r.ghost) return FIG_MATERIALS.glass;
+    return l === 0 ? FIG_MATERIALS.figure0 : FIG_MATERIALS.figureLod;
   }
 
   function buildRecMeshes(r) {
     const geo = figGeo(r.id);
-    for (let l = 0; l < 2; l++) {
+    for (let l = 0; l < 3; l++) {
       const e = geo.lods[l];
-      figLocalMatrix(e, r.met.baseH, r.local[l]);
-      const inst = r.meshes[l] ? r.meshes[l].geometry.attributes.figInst : figInstAttr(r.handles.length, 4);
-      const g = figInstGeometry(e.geometry, { figInst: inst });
-      if (r.meshes[l]) {
-        r.meshes[l].geometry.dispose();
-        r.meshes[l].geometry = g;
-        if (r.depth) r.depth[l].geometry = g;
+      let src;
+      if (l < 2) {
+        src = e.geometry;
+        figLocalMatrix(e, r.met.baseH, r.local[l]);
       } else {
-        const m = figInstanced(g, figMat(r), r.handles.length);
+        src = figFarInstGeometry(e);
+        r.local[2].makeTranslation(0, r.met.baseH, 0).multiply(figM3.makeScale(FIG_CM, FIG_CM, FIG_CM));
+        if (src === e.geometry) r.local[2].multiply(e.dequant);
+      }
+      const g = figInstGeometry(src, { figInst: figInstAttr(r.handles.length, 4) });
+      const old = r.meshes[l];
+      if (old) {
+        const og = old.geometry;
+        old.geometry = g;
+        if (r.depth) r.depth[l].geometry = g;
+        figDisposeOwn(og, FIG_SHARED_ATTRS);
+      } else {
+        const m = figInstanced(g, figMatFor(r, l), r.handles.length);
         m.name = `fig:${r.id}:${l}`;
         m.renderOrder = r.ghost ? 2 : 0;
         m.visible = false;
@@ -1271,13 +1756,13 @@ function createFigureKit(scene, designOf, opts = {}) {
         group.add(m);
         if (r.ghost) {
           // Depth pre-pass twin: shares the geometry and the instance matrices of the ghost mesh.
-          const dm = figInstanced(g, figGhostDepthMaterial(), 1);
+          const dm = figInstanced(g, figGhostDepthMaterial(false), 1);
           dm.instanceMatrix = m.instanceMatrix;
           dm.name = `fig:${r.id}:${l}:depth`;
           dm.renderOrder = 1;
           dm.visible = false;
           dm.receiveShadow = false;
-          if (!r.depth) r.depth = [null, null];
+          if (!r.depth) r.depth = [null, null, null];
           r.depth[l] = dm;
           group.add(dm);
         }
@@ -1285,29 +1770,30 @@ function createFigureKit(scene, designOf, opts = {}) {
       r.tris[l] = e.tris;
       r.force[l] = 1;
     }
-    figLocalMatrix(geo.lods[2], r.met.baseH, r.local[2]);
-    r.tris[2] = geo.lods[2].tris;
+    r.bsrc[1] = figBatchSource(geo.lods[1], false);
+    r.bsrc[2] = figBatchSource(geo.lods[2], true);
+    for (const c of [1, 2]) {
+      r.qlocal[c].makeTranslation(0, r.met.baseH, 0).multiply(figM3.makeScale(FIG_CM, FIG_CM, FIG_CM)).multiply(r.bsrc[c].D);
+    }
+    r.gen++;
   }
-  for (const r of recs) {
-    r.tris = [0, 0, 0];
-    buildRecMeshes(r);
-  }
+  for (const r of recs) buildRecMeshes(r);
 
-  /* Bases: near and mid instanced meshes (the far base is part of the far batch) */
-  const bases = [0, 1].map((l) => {
+  /* Bases: near, mid and far instanced meshes (static handles carry their base in the region batch) */
+  const bases = [0, 1, 2].map((l) => {
     const b = figBuildBase(l);
     const cat = figInstAttr(n, 4);
     const inst = figInstAttr(n, 4);
-    const m = figInstanced(figInstGeometry(b.geometry, { figBaseCat: cat, figInst: inst }), FIG_MATERIALS.base, n);
+    const m = figInstanced(figInstGeometry(b.geometry, { figBaseCat: cat, figInst: inst }), l === 0 ? FIG_MATERIALS.base0 : FIG_MATERIALS.baseLod, n);
     m.name = `fig:base:${l}`;
     m.visible = false;
     meshes.push(m);
     group.add(m);
-    return { mesh: m, cat, inst, cnt: 0, tris: b.tris, sig: 0, prevSig: 0, dirty: 0, force: 1 };
+    return { mesh: m, cat, inst, cnt: 0, tris: b.tris, sig: 0, prevSig: 0, dirty: 0, fxd: 0, force: 1 };
   });
   const baseLocal = new THREE.Matrix4();
 
-  /* Aim outline: the inverted hull of the one highlighted handle (figure and base; 2 draws only while aiming) */
+  /* Aim outline: the inverted hull (mid LOD) of the one highlighted handle (figure and base; 2 draws only while aiming) */
   const outline = [0, 1].map((k) => {
     const m = new THREE.InstancedMesh(new THREE.BufferGeometry(), figOutlineMaterial(), 1);
     m.name = `fig:outline:${k}`;
@@ -1319,110 +1805,314 @@ function createFigureKit(scene, designOf, opts = {}) {
     return m;
   });
 
-  /* Warm-up meshes: one per program, always visible with count 0, so compileAsync compiles every variant */
-  const warm = [FIG_MATERIALS.figurePhys, FIG_MATERIALS.figureStd, FIG_MATERIALS.glass, FIG_MATERIALS.basePhys, FIG_MATERIALS.baseStd].map((mat) => {
-    const isBase = mat === FIG_MATERIALS.basePhys || mat === FIG_MATERIALS.baseStd;
-    const src = isBase ? figBuildBase(2).geometry : figBuildBase(2).geometry;
-    const attrs = { figInst: figInstAttr(1, 4) };
-    if (isBase) attrs.figBaseCat = figInstAttr(1, 4);
-    const m = figInstanced(figInstGeometry(src, attrs), mat, 1);
-    m.visible = true;
+  /* Program warm-up (PERF-PLAN F2): one degenerate one-triangle mesh per figure program, drawn only while on */
+  const warmInstGeo = figWarmGeometry(false);
+  const warmBatchGeo = figWarmGeometry(true);
+  const warmDefs = [
+    [() => FIG_MATERIALS.figure0, false], [() => FIG_MATERIALS.figureLod, false], [() => FIG_MATERIALS.figureBatchPP, true],
+    [() => (FIG_MATERIALS.figureBatchVlitOn ? FIG_MATERIALS.figureBatchVlit : FIG_MATERIALS.figureBatchPP), true],
+    [() => FIG_MATERIALS.base0, false], [() => FIG_MATERIALS.baseLod, false], [() => FIG_MATERIALS.glass, false],
+    [() => FIG_MATERIALS.glassBatch, true], [() => figGhostDepthMaterial(false), false], [() => figGhostDepthMaterial(true), true],
+    [() => figOutlineMaterial(), false],
+  ];
+  const warm = warmDefs.map(([mat, batch]) => {
+    let m;
+    if (batch) {
+      m = new THREE.Mesh(warmBatchGeo, mat());
+      m.matrixAutoUpdate = false;
+    } else {
+      m = figInstanced(warmInstGeo, mat(), 1);
+      m.count = 1;
+    }
+    m.frustumCulled = false;
     m.name = 'fig:warm';
+    m.visible = true;
+    m.renderOrder = -1;
     group.add(m);
     return m;
   });
-  const warmOutline = figInstanced(figInstGeometry(figBuildBase(2).geometry, { figInst: figInstAttr(1, 4) }), figOutlineMaterial(), 1);
-  warmOutline.visible = true;
-  warmOutline.name = 'fig:warm';
-  group.add(warmOutline);
-  warm.push(warmOutline);
-
-  /* Far batches */
-  let far = null;
-  let farGhost = null;
-  let farRebuildAt = 0;
-  function buildFar() {
-    if (far) {
-      group.remove(far.mesh);
-      far.dispose();
-    }
-    if (farGhost) {
-      group.remove(farGhost.mesh);
-      if (farGhost.depthMesh) group.remove(farGhost.depthMesh);
-      farGhost.dispose();
-    }
-    const baseFar = figBuildBase(2);
-    const slots = [];
-    const gslots = [];
-    for (let h = 0; h < n; h++) {
-      const r = recs[designIdx[h]];
-      if (r.ext) continue;
-      const geo = figGeo(r.id);
-      const e = geo.lods[2];
-      if (!e.far) e.far = figFloatCopy(e);
-      const figPart = { src: e.far, local: new THREE.Matrix4().makeTranslation(0, r.met.baseH, 0).multiply(figM3.makeScale(FIG_CM, FIG_CM, FIG_CM)).multiply(e.far.dequant || figIdentity) };
-      const parts = [];
-      if (r.ghost) gslots.push({ h, parts: [figPart] });
-      else parts.push(figPart);
-      if (r.hasBase) parts.push({ src: baseFar.far, local: new THREE.Matrix4().makeScale(r.baseScale * FIG_CM, FIG_CM, r.baseScale * FIG_CM), ring: r.ringSrgb });
-      if (parts.length) slots.push({ h, parts });
-    }
-    far = figCreateFarBatch(FIG_MATERIALS.figure, slots, n);
-    far.mesh.name = 'fig:far';
-    group.add(far.mesh);
-    farGhost = gslots.length ? figCreateFarBatch(FIG_MATERIALS.glass, gslots, n) : null;
-    if (farGhost) {
-      farGhost.mesh.name = 'fig:far-ghost';
-      farGhost.mesh.renderOrder = 2;
-      group.add(farGhost.mesh);
-      const dm = new THREE.Mesh(farGhost.mesh.geometry, figGhostDepthMaterial());
-      dm.name = 'fig:far-ghost:depth';
-      dm.renderOrder = 1;
-      dm.frustumCulled = farGhost.mesh.frustumCulled;
-      dm.matrixAutoUpdate = false;
-      farGhost.depthMesh = dm;
-      group.add(dm);
-    }
-    lod.fill(-1);
+  let warmOn = true;
+  let warmAuto = true;
+  let warmFrames = 0;
+  function setWarm(on) {
+    warmOn = !!on;
+    warm.forEach((m, i) => {
+      m.material = warmDefs[i][0]();
+      m.visible = warmOn;
+    });
   }
-  buildFar();
 
-  /* Baked figures arriving after the kit was built: swap geometries, rebuild the far batch (debounced) */
-  let farStale = false;
+  /* ---- region chunks -------------------------------------------------------------------------------- */
+  const chunks = [];
+  const chunkByKey = new Map();
+  let budgetOverride = 0;
+  let pendingChunks = 0;
+  let job = null;
+  let nowS = 0;
+  const regionShow = { on: false, helpers: [] };
+
+  function chunkId(key, kind) {
+    const k = `${kind}|${key}`;
+    let c = chunkByKey.get(k);
+    if (!c) {
+      c = figNewChunk(chunks.length, k, kind);
+      chunks.push(c);
+      chunkByKey.set(k, c);
+    }
+    return c.id;
+  }
+
+  /** Region of a static handle from its centre: the gameplay resolver (pile sector, shelf section...) or a grid cell. */
+  function resolveRegion(h) {
+    const x = center[h * 4];
+    const y = center[h * 4 + 1];
+    const z = center[h * 4 + 2];
+    let key = null;
+    if (typeof regionKeyFor === 'function') {
+      try {
+        key = regionKeyFor(x, y, z);
+      } catch {
+        key = null;
+      }
+    }
+    if (!key) key = figGridKey(x, z);
+    const o = h * 4;
+    reg[o + FIG_KIND_MID] = chunkId(key, FIG_KIND_MID);
+    reg[o + FIG_KIND_FAR] = chunkId(key, FIG_KIND_FAR);
+    if (recs[designIdx[h]].ghost) {
+      const bar = key.indexOf('|');
+      const grp = bar >= 0 ? key.slice(0, bar) : key;
+      reg[o + FIG_KIND_GMID] = chunkId(grp, FIG_KIND_GMID);
+      reg[o + FIG_KIND_GFAR] = chunkId(grp, FIG_KIND_GFAR);
+    }
+    regOk[h] = 1;
+  }
+
+  /** True when a handle's bounding sphere lies inside the sphere of the batch part that holds it (entry e). */
+  function insidePart(h, e) {
+    const c = chunks[mem[e]];
+    const p = c ? c.parts[memPart[e]] : null;
+    if (!p) return false;
+    const s = p.sphere;
+    const dx = center[h * 4] - s.center.x;
+    const dy = center[h * 4 + 1] - s.center.y;
+    const dz = center[h * 4 + 2] - s.center.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz) + center[h * 4 + 3] <= s.radius + 0.01;
+  }
+
+  /** Class (1 mid, 2 far) a batch can draw an entry pair at: the wanted one if built there, else the other one, else 0. */
+  function drawableClass(h, kMid, cls, needBase) {
+    const o = h * 4;
+    const kp = cls === 2 ? kMid + 1 : kMid;
+    const ka = kp ^ 1;
+    if (reg[o + kp] >= 0 && mem[o + kp] === reg[o + kp] && (!needBase || memBase[o + kp])) return cls;
+    if (reg[o + ka] >= 0 && mem[o + ka] === reg[o + ka] && (!needBase || memBase[o + ka])) return 3 - cls;
+    return 0;
+  }
+
+  let buildKind = 0;
+  const entryOf = (h, out) => {
+    const r = recs[designIdx[h]];
+    const cls = FIG_KIND_CLS[buildKind];
+    if (FIG_KIND_GHOST[buildKind]) {
+      out.fig = r.bsrc[cls];
+      out.base = null;
+    } else {
+      out.fig = r.ghost ? null : r.bsrc[cls];
+      out.base = wantBase[h] && r.hasBase ? baseSrc[cls] : null;
+    }
+  };
+
+  function chunkDirty(c) {
+    return c.force || c.wantA !== c.builtA || c.wantB !== c.builtB || c.wantN !== c.builtN;
+  }
+
+  /**
+   * Starts the (time-sliced) rebuild of one chunk from this frame's wanted entries. One rebuild runs at a time; the old
+   * meshes keep drawing the old members until it lands.
+   */
+  function startJob(c) {
+    buildKind = c.kind;
+    const why = c.force ? 'force' : c.urgent ? 'urgent' : c.adds ? 'adds' : c.compact ? 'compact' : 'drop';
+    FIG_STATS.reasons[why] = (FIG_STATS.reasons[why] || 0) + 1;
+    const cls = FIG_KIND_CLS[c.kind];
+    const caps = c.parts.map((p) => p.cap);
+    job = { c, j: figChunkJob(c.head, nextE, c.wantN, entryOf, keepCpu, cls === 2 ? 0 : 2, cls === 2 ? 1 : 3, caps), A: c.wantA, B: c.wantB, N: c.wantN };
+  }
+
+  function disposePart(p) {
+    group.remove(p.mesh);
+    if (p.depth) group.remove(p.depth);
+    if (p.pp) group.remove(p.pp);
+    figBatchRecycle(p.mesh.geometry);
+    p.mesh.geometry.dispose();
+  }
+
+  /**
+   * Lands the finished rebuild: every part that fits its predecessor's capacity is written into that part's geometry
+   * and meshes (the GL buffers are reused, F2); other parts get new ones and the leftovers are disposed. Then the
+   * chunk's membership switches.
+   */
+  function landJob() {
+    const c = job.c;
+    const ghost = FIG_KIND_GHOST[c.kind];
+    const res = job.j.finish(center);
+    let bytes = 0;
+    let up = 0;
+    const old = c.parts;
+    const parts = [];
+    for (let i = 0; i < res.parts.length; i++) {
+      const np = res.parts[i];
+      const op = old[i];
+      if (op && np.reuse && op.cap && op.cap.nv === np.cap.nv && op.cap.ni === np.cap.ni) {
+        figBatchUpdate(op.mesh.geometry, np);
+        op.sphere = np.sphere;
+        op.tris = np.tris;
+        op.bytes = np.bytes;
+        parts.push(op);
+        FIG_STATS.reused++;
+      } else {
+        if (op) disposePart(op);
+        parts.push(makePart(c, figBatchGeometry(np, keepCpu), np, i, ghost));
+      }
+      bytes += np.bytes;
+      up += np.usedBytes;
+    }
+    for (let i = res.parts.length; i < old.length; i++) disposePart(old[i]);
+    c.parts = parts;
+    landMembers(c, res, bytes, up);
+  }
+
+  /** The meshes of a new batch part: the per-vertex lit draw and its per-pixel twin (or a ghost and its depth pass). */
+  function makePart(c, geometry, p, i, ghost) {
+    const mesh = new THREE.Mesh(geometry, ghost ? FIG_MATERIALS.glassBatch : FIG_MATERIALS.figureBatchVlit);
+    if (!ghost) mesh.onBeforeRender = figVlitBeforeRender;
+    mesh.name = `fig:batch:${c.key}:${i}`;
+    mesh.matrixAutoUpdate = false;
+    mesh.frustumCulled = true;
+    mesh.receiveShadow = true;
+    mesh.renderOrder = ghost ? 2 : 0;
+    group.add(mesh);
+    let depth = null;
+    let pp = null;
+    if (ghost) {
+      depth = new THREE.Mesh(geometry, figGhostDepthMaterial(true));
+      depth.name = `fig:batch:${c.key}:${i}:depth`;
+      depth.matrixAutoUpdate = false;
+      depth.renderOrder = 1;
+      group.add(depth);
+    } else {
+      // Per-pixel twin (same geometry): draws the members that are large on screen; each draw collapses the others.
+      pp = new THREE.Mesh(geometry, FIG_MATERIALS.figureBatchPP);
+      pp.name = `fig:batch:${c.key}:${i}:pp`;
+      pp.matrixAutoUpdate = false;
+      pp.frustumCulled = true;
+      pp.receiveShadow = true;
+      pp.renderOrder = 0;
+      // Until the next update counts the members per path: both draws (each collapses the other set), only the
+      // per-pixel one where the per-vertex path is off (Magas: its program is not compiled there).
+      pp.visible = true;
+      mesh.visible = !!FIG_MATERIALS.figureBatchVlitOn;
+      group.add(pp);
+    }
+    return { mesh, depth, pp, nVL: 0, nPP: 0, sphere: p.sphere, tris: p.tris, bytes: p.bytes, cap: p.cap };
+  }
+
+  /** Switches a landed chunk's membership to the rebuilt member list. */
+  function landMembers(c, res, bytes, up) {
+    c.tris = c.parts.reduce((s, p) => s + p.tris, 0);
+    if (c.members) {
+      for (let k = 0; k < c.members.length; k++) {
+        const e = c.members[k] * 4 + c.kind;
+        if (mem[e] === c.id) mem[e] = -1;
+      }
+    }
+    c.members = res.handles;
+    for (let k = 0; k < res.handles.length; k++) {
+      const h = res.handles[k];
+      const e = h * 4 + c.kind;
+      mem[e] = c.id;
+      memPart[e] = res.partOf[k];
+      memBase[e] = res.baseOf[k];
+      xfDirty[h] = 1;
+    }
+    c.builtA = job.A;
+    c.builtB = job.B;
+    c.builtN = job.N;
+    c.force = false;
+    c.compact = false;
+    c.lastBuild = nowS;
+    c.bytes = bytes;
+    FIG_STATS.regionRebuilds++;
+    frameUpload += up;
+    job = null;
+    if (regionShow.on) showRegions(true);
+  }
+
+  /** Debug: wireframe spheres around every batch part (one colour per chunk). */
+  function showRegions(on) {
+    for (const hlp of regionShow.helpers) {
+      group.remove(hlp);
+      hlp.geometry.dispose();
+      hlp.material.dispose();
+    }
+    regionShow.helpers.length = 0;
+    regionShow.on = !!on;
+    if (!on) return;
+    for (const c of chunks) {
+      for (const p of c.parts) {
+        const m = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 8), new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL((c.id * 0.137) % 1, 0.8, 0.55), wireframe: true, fog: false }));
+        m.position.copy(p.sphere.center);
+        m.scale.setScalar(p.sphere.radius);
+        m.updateMatrix();
+        m.name = 'fig:region-helper';
+        group.add(m);
+        regionShow.helpers.push(m);
+      }
+    }
+  }
+
+  /* Baked figures arriving after the kit was built: swap geometries; the batches rebuild through the design generation */
   const listener = {
     onDesignLoaded(id) {
       const r = recById[id];
       if (!r) return;
       r.met = getFigureMetrics(id);
       buildRecMeshes(r);
-      farStale = true;
+      for (const h of r.handles) poseDirty[h] = 1;
     },
-    onAllLoaded() {
-      farStale = true;
-      farRebuildAt = 0;
-    },
+    onAllLoaded() {},
   };
   FIG_LOAD.listeners.add(listener);
 
   let cam = null;
   const camPos = new THREE.Vector3();
-  const info = { meshes: 0, drawCallsMax: 0, instances: n, loose: 0, shelf: 0, externalIds: [], trisEstimate: 0, near: 0, mid: 0, far: 0, culled: 0, loaded: 0, baked: 0 };
+  const info = { meshes: 0, drawCallsMax: 0, instances: n, loose: 0, shelf: 0, externalIds: [], trisEstimate: 0, near: 0, mid: 0, far: 0, culled: 0, batched: 0, loaded: 0, baked: 0 };
   const extList = [];
   let lastT = 0;
   let forceLod = -1;
+  let primed = false;
+  let batching = true;
+  let frameUpload = 0;
 
-  function lodFor(h, r, dist) {
-    // Size factor relative to a typical figurine at the current FIG_SCALE, so a larger display scale keeps the same
-    // LOD distances (and the Xbox triangle and draw-call budgets) instead of pushing every switch further out.
-    const sf = Math.max(0.6, Math.min(1.8, (r.met.totalH * scl[h]) / (0.14 * FIG_SCALE)));
-    const tn = FIG_LOD.nearDist * sf * quality.dist * quality.zoom;
-    const tm = FIG_LOD.midDist * sf * quality.dist * quality.zoom;
-    const hy = FIG_LOD.hysteresis;
-    const prev = lod[h];
-    if (prev === 0) return dist < tn * (1 + hy) ? 0 : dist < tm ? 1 : 2;
-    if (prev === 1) return dist < tn * (1 - hy) ? 0 : dist > tm * (1 + hy) ? 2 : 1;
-    if (prev === 2) return dist < tn ? 0 : dist < tm * (1 - hy) ? 1 : 2;
-    return dist < tn ? 0 : dist < tm ? 1 : 2;
+  function defaultViewH() {
+    const dpr = typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
+    return (typeof innerHeight === 'number' && innerHeight > 0 ? innerHeight : 1080) * dpr;
+  }
+
+  /** Writes the transform rows of a batched handle: the figure part at class f, the base part at class b (0 = none). */
+  function writeRows(h, r, f, b) {
+    xf.zero(h);
+    figM2.fromArray(hm, h * 16);
+    if (f) {
+      figM1.multiplyMatrices(figM2, r.qlocal[f]);
+      xf.rows(h, f === 2 ? 0 : 2, figM1.elements);
+    }
+    if (b) {
+      baseLocal.makeScale(r.baseScale * FIG_CM, FIG_CM, r.baseScale * FIG_CM).multiply(baseSrc[b].D);
+      figM1.multiplyMatrices(figM2, baseLocal);
+      xf.rows(h, b === 2 ? 1 : 3, figM1.elements);
+    }
   }
 
   const kit = {
@@ -1457,11 +2147,19 @@ function createFigureKit(scene, designOf, opts = {}) {
       fx[h * 2 + 1] = flash;
       fxDirty[h] = 1;
     },
-    /** Aim highlight: rim glow amount 0..1 (0 = off). A highlighted handle is drawn at most at the mid LOD. */
+    /** Aim highlight: rim glow amount 0..1 (0 = off). A highlighted handle is drawn instanced, at least at the mid LOD. */
     setRim(h, amount) {
       if (rim[h] === amount) return;
       rim[h] = amount;
       fxDirty[h] = 1;
+    },
+    /** Pile cover depth (PERF-PLAN F6): 0 free, 1 something rests on it, 2 what rests on it is itself covered. */
+    setCover(h, depth) {
+      cover[h] = Math.max(0, Math.min(2, depth | 0));
+    },
+    /** The held figurine shown in the hand: full detail on every tier, never batched. */
+    setFocus(h, on) {
+      focus[h] = on ? 1 : 0;
     },
     setCategoryShimmer(categoryKey, amount) {
       const i = FIG_CATEGORY_INDEX[categoryKey];
@@ -1471,86 +2169,154 @@ function createFigureKit(scene, designOf, opts = {}) {
     setCamera(camera) {
       cam = camera;
     },
-    /**
-     * LOD distance multiplier for a narrowed view (binocular zoom): 1 = normal, larger keeps the near and mid LODs out
-     * to proportionally larger distances, since the magnified figures cover more pixels.
-     */
-    setLodZoom(k) {
-      quality.zoom = Math.max(1, k);
-    },
-    /** Development / preview: draw every handle at one LOD (0, 1, 2), or -1 for distance-based LOD. */
+    /** Kept for compatibility: the pixel-height LOD reads the zoom from the projection matrix. */
+    setLodZoom() {},
+    /** Development / preview: draw every handle at one LOD (0, 1, 2), or -1 for the pixel-height LOD. */
     setForceLod(l) {
       forceLod = l;
       for (let h = 0; h < n; h++) poseDirty[h] = 1;
     },
+    /** Governor detail step 0..2 (thresholds x 1.25^n, max counts x 0.7^n); never changes a shader program. */
+    setDetailLevel(level) {
+      detail = Math.max(0, Math.min(2, level | 0));
+    },
+    /** Scale-1 drawing-buffer size in pixels (dynamic resolution does not change the LOD). */
+    setViewport(w, h) {
+      if (h > 0) viewH = h;
+    },
+    setEnvMap(tex) {
+      figSetEnvMap(tex);
+    },
+    setWarmup(on) {
+      warmAuto = false;
+      setWarm(on);
+    },
+    /** One mesh per figure program of the current tier (instanced and batch variants), for staged compiling. */
+    warmupObjects() {
+      setWarm(warmOn);
+      return warm.slice();
+    },
+    /** After a restored WebGL context: every dynamic buffer and the transform texture upload again. */
+    onContextRestored() {
+      for (const r of recs) r.force.fill(1);
+      for (const b of bases) b.force = 1;
+      for (const e of extList) e.force = 1;
+      xf.dirty = true;
+      xf.full = true;
+      if (!keepCpu) for (const c of chunks) c.force = true;
+    },
+    /**
+     * Builds the region batches before the first frame (boot step 8): every handle posed so far counts as settled, and
+     * the batches are built in slices of about budgetMs with `await yieldFn()` between them.
+     */
+    async buildDeferred(yieldFn, budgetMs = 6) {
+      const prev = budgetOverride;
+      budgetOverride = Math.max(0.5, budgetMs);
+      try {
+        for (let i = 0; i < 600; i++) {
+          kit.update(lastT, null);
+          if (!pendingChunks && !job) break;
+          if (yieldFn) await yieldFn();
+        }
+      } finally {
+        budgetOverride = prev;
+      }
+    },
     /** Once per frame after all pose / mode changes. */
     update(t = lastT, camera = null) {
+      const tStart = performance.now();
       lastT = t;
+      nowS = tStart / 1000;
       FIG_UNIFORMS.time.value = t;
       if (camera) cam = camera;
-      if (farStale && (FIG_LOAD.done || t - farRebuildAt > 1.5)) {
-        farStale = false;
-        farRebuildAt = t;
-        buildFar();
+      frameUpload = 0;
+      if (warmAuto && ++warmFrames > 10) {
+        warmAuto = false;
+        setWarm(false);
       }
+      const stillOnPose = primed ? 0 : FIG_PERF.still;
       const haveCam = !!cam;
+      let P5 = 1;
       if (haveCam) {
         cam.updateMatrixWorld();
         figPS.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
         figFrustum.setFromProjectionMatrix(figPS);
         camPos.setFromMatrixPosition(cam.matrixWorld);
+        P5 = cam.projectionMatrix.elements[5];
       }
+      const halfH = 0.5 * Math.max(viewH > 0 ? viewH : defaultViewH(), T.minH || 0);
+      const mult = adapt * Math.pow(1.25, detail);
+      const t0 = T.t0 * mult;
+      const t1 = T.t1 * mult;
+      const aimT0 = Math.min(T.t0, FIG_PERF.aimT0) * mult;
+      const hy = FIG_PERF.hyst;
+      const tPre = t1 * (1 + hy) * FIG_PERF.prefetch;
+      const max0 = Math.max(1, Math.round(T.max0 * Math.pow(0.7, detail)));
+      const max1 = Math.max(4, Math.round(T.max1 * Math.pow(0.7, detail)));
+      const keepFrames = Math.round(FIG_PERF.keepDynS * 60);
       // Upload tracking: each instanced mesh keeps a signature of the handles it drew (in order) plus a dirty flag
       // for changed poses / effects, so an unchanged view uploads nothing.
       for (const r of recs) {
-        r.cnt[0] = 0;
-        r.cnt[1] = 0;
-        r.sig[0] = 0;
-        r.sig[1] = 0;
-        r.dirty[0] = r.force[0];
-        r.dirty[1] = r.force[1];
+        for (let l = 0; l < 3; l++) {
+          r.cnt[l] = 0;
+          r.sig[l] = 0;
+          r.dirty[l] = r.force[l];
+          r.fxd[l] = 0;
+        }
       }
       for (const b of bases) {
         b.cnt = 0;
         b.sig = 0;
         b.dirty = b.force;
+        b.fxd = 0;
       }
       for (const e of extList) {
         e.cnt = 0;
         e.sig = 0;
         e.dirty = e.force === 0 ? 0 : 1;
       }
-      let nNear = 0;
-      let nMid = 0;
-      let nFar = 0;
-      let nCull = 0;
-      let olH = -1;
-      let olL = 0;
-      let olV = 0.02;
-      let loose = 0;
-      let shelf = 0;
-      let tris = 0;
+      for (const c of chunks) {
+        c.wantA = 0;
+        c.wantB = 0;
+        c.wantN = 0;
+        c.adds = 0;
+        c.urgent = 0;
+        c.live = 0;
+        c.lazy = 0;
+        c.lazyTris = 0;
+        c.liveTris = 0;
+        c.head = -1;
+        for (const p of c.parts) {
+          p.nVL = 0;
+          p.nPP = 0;
+        }
+      }
       for (let i = 0; i < shimmer.length; i++) {
         if (shimmer[i] !== shimmerPrev[i]) {
           shimmerPrev[i] = shimmer[i];
           for (const r of recs) if (r.catIndex === i) for (const h of r.handles) if (mode[h] === FIG_MODE.SHELF) fxDirty[h] = 1;
         }
       }
+
+      /* Pass 1: pose, pixel height, LOD, static detection, wanted batch membership, batch drawability */
+      let n0 = 0;
+      let n1 = 0;
       for (let h = 0; h < n; h++) {
+        const o4 = h * 4;
+        want[o4] = -1;
+        want[o4 + 1] = -1;
+        want[o4 + 2] = -1;
+        want[o4 + 3] = -1;
+        chunkOk[h] = 0;
         const m = mode[h];
         if (m === FIG_MODE.HIDDEN) {
-          if (lod[h] === 2) {
-            far.collapse(h);
-            if (farGhost) farGhost.collapse(h);
-          }
           lod[h] = -1;
+          fin[h] = -1;
+          still[h] = 0;
           continue;
         }
-        if (m === FIG_MODE.LOOSE) loose++;
-        else shelf++;
         const r = recs[designIdx[h]];
         const s = scl[h];
-        const dirtyH = poseDirty[h] | fxDirty[h];
         if (poseDirty[h]) {
           figV1.set(pos[h * 3], pos[h * 3 + 1], pos[h * 3 + 2]);
           figQ1.set(quat[h * 4], quat[h * 4 + 1], quat[h * 4 + 2], quat[h * 4 + 3]);
@@ -1561,40 +2327,242 @@ function createFigureKit(scene, designOf, opts = {}) {
           center[h * 4 + 1] = figV2.y;
           center[h * 4 + 2] = figV2.z;
           center[h * 4 + 3] = Math.max(r.met.totalH * 0.6, r.met.radius * 1.2) * s;
-        }
-        const glow = fx[h * 2];
-        const flash = fx[h * 2 + 1];
-        const shim = m === FIG_MODE.SHELF ? shimmer[r.catIndex] : 0;
-        let L = 1;
+          still[h] = stillOnPose;
+          regOk[h] = 0;
+          xfDirty[h] = 1;
+        } else if (still[h] < 255) still[h]++;
+        let Lr = 1;
+        let hpx = 1e9;
         if (haveCam) {
           const dx = center[h * 4] - camPos.x;
           const dy = center[h * 4 + 1] - camPos.y;
           const dz = center[h * 4 + 2] - camPos.z;
-          L = lodFor(h, r, Math.sqrt(dx * dx + dy * dy + dz * dz));
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          dist[h] = d;
+          hpx = (r.met.totalH * s * halfH * P5) / Math.max(d, 0.05);
+          const prev = lod[h];
+          if (prev === 0) Lr = hpx >= t0 * (1 - hy) ? 0 : hpx >= t1 ? 1 : 2;
+          else if (prev === 1) Lr = hpx >= t0 * (1 + hy) ? 0 : hpx < t1 * (1 - hy) ? 2 : 1;
+          else if (prev === 2) Lr = hpx >= t0 * (1 + hy) ? 0 : hpx >= t1 * (1 + hy) ? 1 : 2;
+          else Lr = hpx >= t0 ? 0 : hpx >= t1 ? 1 : 2;
+        } else dist[h] = 0;
+        lod[h] = Lr;
+        hpxA[h] = hpx;
+        let L = Lr;
+        const cv = cover[h];
+        let noBase = 0;
+        if (cv >= 2) {
+          // Buried two deep: far LOD, except while it is large on screen (zoomed in, or a pile right in front of the
+          // camera) on the tiers whose one-deep cap is LOD1: from cover2Up x t0 (with the LOD hysteresis) LOD1,
+          // because the far LOD shows faceted bases and blocky robes at that size (integration, DECISIONS.md 14).
+          // The base stays except on Mento (base discs carry the look of the porous pile).
+          let up = 0;
+          if (T.cover1 === 1 && haveCam) up = hpx >= t0 * FIG_PERF.cover2Up * (c2up[h] ? 1 - hy : 1 + hy) ? 1 : 0;
+          c2up[h] = up;
+          L = up ? 1 : 2;
+          noBase = T.cover2NoBase && L === 2 ? 1 : 0;
+        } else if (cv === 1 && L < T.cover1) L = T.cover1;
+        if (rim[h] > 0) {
+          L = Math.min(L, 1);
+          if (haveCam && hpx >= aimT0) L = 0;
         }
+        if (focus[h]) L = 0;
+        if (r.ext) L = Math.min(L, 1);
         if (forceLod >= 0) L = forceLod;
-        if (r.ext || rim[h] > 0) L = Math.min(L, 1);
-        const wasFar = lod[h] === 2;
-        lod[h] = L;
-        if (L === 2) {
-          if (!wasFar || poseDirty[h] || fxDirty[h]) {
-            figM2.fromArray(hm, h * 16);
-            // No base wanted (actors, figurines lying in a pile): the base part of the far slot is collapsed.
-            far.write(h, figM2, glow, flash, shim, !baseOn[h] && r.hasBase);
-            if (farGhost) farGhost.write(h, figM2, glow, flash, shim);
-          }
-          poseDirty[h] = 0;
-          fxDirty[h] = 0;
-          if (L === 2) {
-            nFar++;
-            continue;
-          }
-        } else if (wasFar) {
-          far.collapse(h);
-          if (farGhost) farGhost.collapse(h);
+        const cls = L === 2 ? 2 : 1;
+        const capFar = (cv >= 2 && L === 2) || (cv === 1 && T.cover1 === 2);
+        const baseW = r.hasBase && baseOn[h] && !noBase ? 1 : 0;
+        wantBase[h] = baseW;
+        const isStatic = batching && still[h] >= FIG_PERF.still && rim[h] === 0 && !focus[h] && !r.ext && forceLod !== 0;
+        let keepDyn = false;
+        if (isStatic) {
+          dyn[h] = 0;
+          if (!regOk[h]) resolveRegion(h);
+        } else {
+          if (dyn[h] < 65535) dyn[h]++;
+          // A member that only wobbles (aimed pop, hop) keeps its place in the batches while it stays inside them.
+          keepDyn = batching && (dyn[h] < keepFrames || rim[h] > 0) && !focus[h] && !r.ext;
         }
+        // Wanted batch entries: mid batch when mid (or full detail, or about to become mid), far batch when far;
+        // current members stay (lazily) until their batch is compacted, so an LOD switch back only toggles rows.
+        const kFig = r.ghost ? FIG_KIND_GMID : FIG_KIND_MID;
+        for (let kind = 0; kind < 4; kind++) {
+          const e = o4 + kind;
+          const cid = reg[e];
+          if (cid < 0) continue;
+          const ghostKind = FIG_KIND_GHOST[kind];
+          if (ghostKind !== r.ghost && (ghostKind || !baseW)) continue;
+          const c = chunks[cid];
+          const member = mem[e] === cid;
+          let w = false;
+          if (isStatic) {
+            // (no prefetch for pile figurines the cover rule keeps far)
+            const kc = FIG_KIND_CLS[kind];
+            w = kc === 1 ? L <= 1 || (hpx >= tPre && !capFar) : L === 2;
+            // A member this batch still draws (at the old LOD, until its new batch lands) is never dropped.
+            const drawnHere = member && (ghostKind || !r.ghost ? (xfState[h] & 3) === kc : (xfState[h] >> 2) === kc);
+            if (!w && member && (drawnHere || !c.compact)) {
+              w = true;
+              if (!drawnHere) {
+                c.lazy++;
+                c.lazyTris += (ghostKind || !r.ghost ? r.bsrc[kc].tris : 0) + (!ghostKind && baseW ? baseSrc[kc].tris : 0);
+              }
+            }
+          } else if (keepDyn && member && insidePart(h, e)) w = true;
+          if (!w) continue;
+          want[e] = cid;
+          const key = ((h * 2 + baseW) * 64 + (r.gen & 63)) | 0;
+          c.wantA = (c.wantA + figMix(key)) | 0;
+          c.wantB = (c.wantB ^ figMix(key ^ 0x5bd1e995)) | 0;
+          c.wantN++;
+          nextE[e] = c.head;
+          c.head = e;
+          if (!member) c.adds++;
+        }
+        if (isStatic) {
+          let fc = drawableClass(h, kFig, cls, !r.ghost && baseW === 1);
+          let bc = 0;
+          if (r.ghost && baseW) bc = drawableClass(h, FIG_KIND_MID, cls, true);
+          else if (baseW) bc = fc;
+          let ok = fc > 0 && (!baseW || bc > 0);
+          // A settled member that moved out of its part's sphere would be culled wrongly: rebuild, draw it instanced.
+          if (ok && xfDirty[h]) {
+            const ef = o4 + kFig + (fc === 2 ? 1 : 0);
+            if (!insidePart(h, ef)) {
+              chunks[mem[ef]].force = true;
+              ok = false;
+            }
+            if (ok && r.ghost && bc) {
+              const eb = o4 + FIG_KIND_MID + (bc === 2 ? 1 : 0);
+              if (!insidePart(h, eb)) {
+                chunks[mem[eb]].force = true;
+                ok = false;
+              }
+            }
+          }
+          if (!ok) {
+            fc = 0;
+            bc = 0;
+            for (let kind = 0; kind < 4; kind++) if (want[o4 + kind] >= 0 && mem[o4 + kind] !== want[o4 + kind]) chunks[want[o4 + kind]].urgent++;
+          }
+          drawF[h] = fc;
+          drawB[h] = bc;
+          chunkOk[h] = ok ? 1 : 0;
+        }
+        if (L === 0) {
+          fin[h] = 0;
+          cand0[n0++] = (focus[h] ? 0 : Math.floor(dist[h] * 1000) + 1) * 4096 + h;
+        } else if (chunkOk[h]) fin[h] = -2;
+        else {
+          fin[h] = L;
+          if (L === 1) cand1[n1++] = Math.floor(dist[h] * 1000) * 4096 + h;
+        }
+      }
+      // Full-detail cap: the farthest are demoted (to their batch when they are members, else to the mid LOD).
+      if (n0 > max0) {
+        const c0 = cand0.subarray(0, n0);
+        c0.sort();
+        for (let i = max0; i < n0; i++) {
+          const h = c0[i] % 4096;
+          if (focus[h]) continue;
+          if (chunkOk[h]) fin[h] = -2;
+          else {
+            fin[h] = 1;
+            cand1[n1++] = Math.floor(dist[h] * 1000) * 4096 + h;
+          }
+        }
+      }
+      // Mid-LOD instance cap (moving figurines): the farthest drop to the far LOD.
+      if (n1 > max1) {
+        const c1 = cand1.subarray(0, n1);
+        c1.sort();
+        for (let i = max1; i < n1; i++) fin[c1[i] % 4096] = 2;
+      }
+
+      /* Pass 2: transform texture rows of batched handles, instanced writes for the rest */
+      let nNear = 0;
+      let nMid = 0;
+      let nFar = 0;
+      let nCull = 0;
+      let nBatch = 0;
+      let nCovered = 0;
+      let bMid = 0;
+      let olH = -1;
+      let olV = 0.02;
+      let loose = 0;
+      let shelf = 0;
+      let instTris = 0;
+      for (let h = 0; h < n; h++) {
+        const L = fin[h];
+        if (L === -1) {
+          if (xfState[h]) {
+            xf.zero(h);
+            xfState[h] = 0;
+          }
+          continue;
+        }
+        const m = mode[h];
+        if (m === FIG_MODE.LOOSE) loose++;
+        else shelf++;
+        if (cover[h]) nCovered++;
+        const r = recs[designIdx[h]];
+        const glow = fx[h * 2];
+        const flash = fx[h * 2 + 1];
+        const shim = m === FIG_MODE.SHELF ? shimmer[r.catIndex] : 0;
+        const dirtyH = poseDirty[h] | fxDirty[h];
+        const fxCh = fxDirty[h];
+        // An effects-only change (a pulsing glint, the aim rim) uploads only the effects attribute (F3).
+        const poseH = poseDirty[h];
         poseDirty[h] = 0;
         fxDirty[h] = 0;
+        if (L === -2) {
+          const f = drawF[h];
+          const b = drawB[h];
+          const st = f | (b << 2);
+          // Effects texel only for batched handles (instanced ones carry their effects per instance).
+          if (fxCh || xfState[h] !== st) xf.fx(h, rim[h], glow, flash, shim);
+          if (xfState[h] !== st || xfDirty[h]) {
+            writeRows(h, r, f, b);
+            xfState[h] = st;
+            xfDirty[h] = 0;
+          }
+          const o4 = h * 4;
+          const kFig = r.ghost ? FIG_KIND_GMID : FIG_KIND_MID;
+          const cf = chunks[mem[o4 + kFig + (f === 2 ? 1 : 0)]];
+          cf.live++;
+          cf.liveTris += r.bsrc[f].tris + (b && !r.ghost ? baseSrc[b].tris : 0);
+          if (r.ghost && b) {
+            const cb = chunks[mem[o4 + FIG_KIND_MID + (b === 2 ? 1 : 0)]];
+            cb.live++;
+            cb.liveTris += baseSrc[b].tris;
+          }
+          nBatch++;
+          if (f === 1) bMid++;
+          // Shading path of its opaque part (figure and base, or a ghost's base): per vertex while small on screen,
+          // per pixel when large or on Magas (hysteresis as the LOD); the part's two draws each collapse the other set.
+          const oe = r.ghost ? (b ? o4 + FIG_KIND_MID + (b === 2 ? 1 : 0) : -1) : o4 + kFig + (f === 2 ? 1 : 0);
+          if (oe >= 0) {
+            let pp = 1;
+            if (FIG_MATERIALS.figureBatchVlitOn) {
+              const tp = (r.ghost ? b : f) === 2 ? T.ppFar : T.ppMid;
+              pp = hpxA[h] >= tp * (shadePP[h] ? 1 - FIG_PERF.hyst : 1 + FIG_PERF.hyst) ? 1 : 0;
+            }
+            if (pp !== shadePP[h]) {
+              shadePP[h] = pp;
+              xf.mode(h, pp);
+            }
+            const op = chunks[mem[oe]].parts[memPart[oe]];
+            if (op) {
+              if (pp) op.nPP++;
+              else op.nVL++;
+            }
+          }
+          continue;
+        }
+        if (xfState[h]) {
+          xf.zero(h);
+          xfState[h] = 0;
+        }
         if (haveCam) {
           figSphere.center.set(center[h * 4], center[h * 4 + 1], center[h * 4 + 2]);
           figSphere.radius = center[h * 4 + 3];
@@ -1607,7 +2575,6 @@ function createFigureKit(scene, designOf, opts = {}) {
         if (rim[h] > olV && !r.ext) {
           olV = rim[h];
           olH = h;
-          olL = L;
         }
         if (r.ext) {
           const e = r.ext;
@@ -1622,11 +2589,12 @@ function createFigureKit(scene, designOf, opts = {}) {
             a[k * 4 + 2] = flash;
             a[k * 4 + 3] = shim;
           }
-          tris += e.tris;
+          instTris += e.tris;
         } else {
           const k = r.cnt[L]++;
           r.sig[L] = (Math.imul(r.sig[L], 31) + h + 1) | 0;
-          if (dirtyH) r.dirty[L] = 1;
+          if (poseH) r.dirty[L] = 1;
+          else if (fxCh) r.fxd[L] = 1;
           const mesh = r.meshes[L];
           figM1.multiplyMatrices(figM2, r.local[L]);
           figM1.toArray(mesh.instanceMatrix.array, k * 16);
@@ -1635,15 +2603,17 @@ function createFigureKit(scene, designOf, opts = {}) {
           a[k * 4 + 1] = glow;
           a[k * 4 + 2] = flash;
           a[k * 4 + 3] = shim;
-          tris += r.tris[L];
+          instTris += r.tris[L] * (r.ghost ? 2 : 1);
         }
         if (L === 0) nNear++;
-        else nMid++;
-        if (r.hasBase && baseOn[h]) {
+        else if (L === 1) nMid++;
+        else nFar++;
+        if (wantBase[h]) {
           const b = bases[L];
           const k = b.cnt++;
           b.sig = (Math.imul(b.sig, 31) + h + 1) | 0;
-          if (dirtyH) b.dirty = 1;
+          if (poseH) b.dirty = 1;
+          else if (fxCh) b.fxd = 1;
           baseLocal.makeScale(r.baseScale * FIG_CM, FIG_CM, r.baseScale * FIG_CM);
           figM1.multiplyMatrices(figM2, baseLocal);
           figM1.toArray(b.mesh.instanceMatrix.array, k * 16);
@@ -1657,12 +2627,12 @@ function createFigureKit(scene, designOf, opts = {}) {
           a[k * 4 + 1] = glow * 0.5;
           a[k * 4 + 2] = flash * 0.5;
           a[k * 4 + 3] = 0;
-          tris += b.tris;
+          instTris += b.tris;
         }
       }
       let draws = 0;
       for (const r of recs) {
-        for (let l = 0; l < 2; l++) {
+        for (let l = 0; l < 3; l++) {
           const mesh = r.meshes[l];
           const c = r.cnt[l];
           mesh.count = c;
@@ -1673,12 +2643,11 @@ function createFigureKit(scene, designOf, opts = {}) {
           }
           if (c > 0) {
             if (r.dirty[l] || r.sig[l] !== r.prevSig[l]) {
-              figUpload(mesh.instanceMatrix, c, 16);
-              figUpload(mesh.geometry.attributes.figInst, c, 4);
+              frameUpload += figUpload(mesh.instanceMatrix, c, 16) + figUpload(mesh.geometry.attributes.figInst, c, 4);
               r.prevSig[l] = r.sig[l];
               r.force[l] = 0;
-            }
-            draws++;
+            } else if (r.fxd[l]) frameUpload += figUpload(mesh.geometry.attributes.figInst, c, 4);
+            draws += r.ghost ? 2 : 1;
           } else r.force[l] = 1; // handles may move while undrawn: upload again when the mesh reappears
         }
       }
@@ -1688,10 +2657,7 @@ function createFigureKit(scene, designOf, opts = {}) {
           em.count = e.cnt;
           em.visible = e.cnt > 0;
           if (e.cnt > 0) {
-            if (up) {
-              figUpload(em.instanceMatrix, e.cnt, 16);
-              figUpload(em.geometry.attributes.figInst, e.cnt, 4);
-            }
+            if (up) frameUpload += figUpload(em.instanceMatrix, e.cnt, 16) + figUpload(em.geometry.attributes.figInst, e.cnt, 4);
             draws++;
           }
         }
@@ -1705,60 +2671,183 @@ function createFigureKit(scene, designOf, opts = {}) {
         b.mesh.visible = b.cnt > 0;
         if (b.cnt > 0) {
           if (b.dirty || b.sig !== b.prevSig) {
-            figUpload(b.mesh.instanceMatrix, b.cnt, 16);
-            figUpload(b.cat, b.cnt, 4);
-            figUpload(b.inst, b.cnt, 4);
+            frameUpload += figUpload(b.mesh.instanceMatrix, b.cnt, 16) + figUpload(b.cat, b.cnt, 4) + figUpload(b.inst, b.cnt, 4);
             b.prevSig = b.sig;
             b.force = 0;
-          }
+          } else if (b.fxd) frameUpload += figUpload(b.inst, b.cnt, 4);
           draws++;
         } else b.force = 1;
       }
-      far.flush();
-      if (farGhost) farGhost.flush();
-      draws += 1 + (farGhost ? 1 : 0);
-      tris += far.liveTris + (farGhost ? farGhost.liveTris : 0);
-      // Aim outline around the most highlighted visible handle (figure, then its base).
+      // Aim outline around the most highlighted visible handle (figure, then its base), mid-LOD hull.
       outline[0].visible = false;
       outline[1].visible = false;
       if (olH >= 0) {
         const r = recs[designIdx[olH]];
         figM2.fromArray(hm, olH * 16);
-        outline[0].geometry = r.meshes[olL].geometry;
-        figM1.multiplyMatrices(figM2, r.local[olL]);
+        outline[0].geometry = r.meshes[1].geometry;
+        figM1.multiplyMatrices(figM2, r.local[1]);
         outline[0].setMatrixAt(0, figM1);
         outline[0].instanceMatrix.needsUpdate = true;
         outline[0].visible = true;
         draws++;
-        tris += r.tris[olL];
-        if (r.hasBase && baseOn[olH]) {
-          outline[1].geometry = bases[olL].mesh.geometry;
+        instTris += r.tris[1];
+        if (wantBase[olH]) {
+          outline[1].geometry = bases[1].mesh.geometry;
           baseLocal.makeScale(r.baseScale * FIG_CM, FIG_CM, r.baseScale * FIG_CM);
           figM1.multiplyMatrices(figM2, baseLocal);
           outline[1].setMatrixAt(0, figM1);
           outline[1].instanceMatrix.needsUpdate = true;
           outline[1].visible = true;
           draws++;
-          tris += bases[olL].tris;
+          instTris += bases[1].tris;
         }
         FIG_MATERIALS.outline.uniforms.uAmount.value = Math.min(1, olV);
       }
+      if (warmOn) draws += warm.length;
+
+      /* Region batches: visibility, statistics, compaction and the time-sliced rebuilds (highest priority first) */
+      let chunkTris = 0;
+      let liveTris = 0;
+      let inView = 0;
+      let liveChunks = 0;
+      for (const c of chunks) {
+        c.inView = false;
+        if (c.parts.length) liveChunks++;
+        const gh = FIG_KIND_GHOST[c.kind];
+        let cx = 0;
+        let cy = 0;
+        let cz = 0;
+        for (const p of c.parts) {
+          const vis = !haveCam || figFrustum.intersectsSphere(p.sphere);
+          // Opaque parts: the per-vertex draw and the per-pixel twin only when they have members to draw.
+          let nd = 2;
+          if (!gh) {
+            p.mesh.visible = p.nVL > 0;
+            p.pp.visible = p.nPP > 0;
+            nd = (p.nVL > 0 ? 1 : 0) + (p.nPP > 0 ? 1 : 0);
+          }
+          if (vis) {
+            c.inView = true;
+            draws += nd;
+            chunkTris += p.tris * nd;
+          }
+          cx = p.sphere.center.x;
+          cy = p.sphere.center.y;
+          cz = p.sphere.center.z;
+        }
+        if (!c.parts.length && c.head >= 0) {
+          const hh = c.head >> 2;
+          cx = center[hh * 4];
+          cy = center[hh * 4 + 1];
+          cz = center[hh * 4 + 2];
+          if (haveCam) {
+            figSphere.center.set(cx, cy, cz);
+            figSphere.radius = 1.5;
+            c.inView = figFrustum.intersectsSphere(figSphere);
+          }
+        }
+        if (c.inView) {
+          inView++;
+          liveTris += c.liveTris;
+        }
+        c.dist = haveCam ? Math.hypot(cx - camPos.x, cy - camPos.y, cz - camPos.z) : 0;
+        // Compaction: a batch that holds many members it no longer draws (their triangles are collapsed but still
+        // vertex-shaded) drops the ones it keeps only lazily on its next rebuild.
+        const nm = c.members ? c.members.length : 0;
+        if (nm && !c.compact) {
+          const age = nowS - c.lastBuild;
+          const waste = c.lazyTris;
+          if (age > FIG_PERF.compactS && ((waste > FIG_PERF.compactTris && waste > c.tris * FIG_PERF.compactShare) || c.lazy > nm * 0.5)) c.compact = true;
+          else if (age > FIG_PERF.compactFastS && waste > FIG_PERF.compactFastTris) c.compact = true;
+        }
+      }
+      // F7: static figurines no batch can draw yet are drawn instanced (draw calls and triangles over budget after
+      // picks and throws): the more of them, the larger the rebuild budget (up to twice the tier's), and the chunks
+      // that hold most of them go first.
+      let stragglers = 0;
+      for (const c of chunks) stragglers += c.urgent;
+      const budget = budgetOverride > 0 ? budgetOverride : T.budgetMs * (1 + Math.min(1, stragglers / 40));
+      const tb = performance.now();
+      const deadline = tb + budget;
+      pendingChunks = 0;
+      for (let guard = 0; guard <= chunks.length; guard++) {
+        if (job) {
+          // Continue the rebuild in flight (members copied until the frame's rebuild budget is spent).
+          if (job.j.step(deadline)) landJob();
+          if (performance.now() > deadline) break;
+          continue;
+        }
+        let best = null;
+        let bestScore = Infinity;
+        let pending = 0;
+        for (const c of chunks) {
+          if (!chunkDirty(c)) continue;
+          pending++;
+          if (!budgetOverride && !c.force && !c.urgent) {
+            const wait = c.adds ? (FIG_KIND_CLS[c.kind] === 2 ? FIG_PERF.minRebuildFarS : FIG_PERF.minRebuildS) : c.lazyTris > FIG_PERF.compactFastTris ? FIG_PERF.compactFastS : FIG_PERF.compactS;
+            if (nowS - c.lastBuild < wait) continue;
+          }
+          const score = (c.inView ? 0 : 100) + c.dist - (c.urgent ? 50 + Math.min(40, c.urgent * 2) : 0) - (c.adds ? 20 : 0);
+          if (score < bestScore) {
+            bestScore = score;
+            best = c;
+          }
+        }
+        pendingChunks = pending;
+        if (!best) break;
+        startJob(best);
+      }
+      if (job) pendingChunks = Math.max(1, pendingChunks);
+      const rebuildMs = performance.now() - tb;
+      // Triangle budget: thresholds rise 10 % per frame while over it, and fall back 2 % per frame well below it.
+      // Measured on the drawn triangles (members a batch holds for an LOD switch but does not draw are collapsed).
+      const figTris = instTris + chunkTris;
+      const drawnTris = instTris + liveTris;
+      if (forceLod < 0) {
+        if (drawnTris > T.tris) adapt = Math.min(4, adapt * 1.1);
+        else if (drawnTris < T.tris * 0.85) adapt = Math.max(1, adapt * 0.98);
+      }
+      frameUpload += xf.flush();
       info.near = nNear;
-      info.mid = nMid;
-      info.far = nFar;
+      info.mid = nMid + bMid;
+      info.far = nFar + (nBatch - bMid);
       info.culled = nCull;
+      info.batched = nBatch;
       info.loose = loose;
       info.shelf = shelf;
-      info.trisEstimate = tris;
+      info.trisEstimate = figTris;
       info.drawCallsMax = draws;
+      FIG_STATS.kit = kit;
+      FIG_STATS.draws = draws;
+      FIG_STATS.tris = figTris;
+      FIG_STATS.instTris = instTris;
+      FIG_STATS.chunkTris = chunkTris;
+      FIG_STATS.liveTris = drawnTris;
+      FIG_STATS.lod0 = nNear;
+      FIG_STATS.lod1 = nMid + bMid;
+      FIG_STATS.far = nFar + (nBatch - bMid);
+      FIG_STATS.batched = nBatch;
+      FIG_STATS.covered = nCovered;
+      FIG_STATS.culled = nCull;
+      FIG_STATS.rebuildMs = rebuildMs;
+      FIG_STATS.uploadBytesFrame = frameUpload;
+      FIG_STATS.chunks = liveChunks;
+      FIG_STATS.chunksInView = inView;
+      FIG_STATS.dirtyChunks = pendingChunks;
+      FIG_STATS.adapt = adapt;
+      primed = true;
+      FIG_STATS.updateMs = performance.now() - tStart - rebuildMs;
     },
     setQuality(q) {
       figApplyQuality(q);
-      quality.q = q;
-      quality.dist = q === 'xbox' ? 1 : 1.3;
-      for (const r of recs) for (const m of r.meshes) if (m) m.material = figMat(r);
-      for (const b of bases) b.mesh.material = FIG_MATERIALS.base;
-      if (far) far.mesh.material = FIG_MATERIALS.figure;
+      tier = figTierId(q);
+      T = FIG_TIER[tier];
+      adapt = 1;
+      for (const r of recs) for (let l = 0; l < 3; l++) if (r.meshes[l]) r.meshes[l].material = figMatFor(r, l);
+      bases.forEach((b, l) => {
+        b.mesh.material = l === 0 ? FIG_MATERIALS.base0 : FIG_MATERIALS.baseLod;
+      });
+      setWarm(warmOn);
     },
     /** Replaces the procedural figure of a design with an external one (pose-space geometry, metres). */
     registerExternalFigure(designId, ext) {
@@ -1766,7 +2855,7 @@ function createFigureKit(scene, designOf, opts = {}) {
       if (!r || !ext || !ext.meshesByMaterial || !ext.meshesByMaterial.length) return false;
       if (r.ext) return true;
       const cap = r.handles.length;
-      const e = { id: designId, meshes: [], cnt: 0, tris: ext.tris || 0 };
+      const e = { id: designId, meshes: [], cnt: 0, tris: ext.tris || 0, sig: 0, prevSig: 0, dirty: 1, force: 1 };
       for (const part of ext.meshesByMaterial) {
         const g = part.geometry.clone();
         g.setAttribute('figInst', figInstAttr(cap, 4));
@@ -1782,12 +2871,9 @@ function createFigureKit(scene, designOf, opts = {}) {
       r.ext = e;
       extList.push(e);
       for (const h of r.handles) {
-        far.collapse(h);
-        if (farGhost) farGhost.collapse(h);
         lod[h] = -1;
         poseDirty[h] = 1;
       }
-      farStale = true;
       info.externalIds.push(designId);
       return true;
     },
@@ -1811,28 +2897,121 @@ function createFigureKit(scene, designOf, opts = {}) {
       return figWhenLoaded();
     },
     getInfo() {
-      let m = recs.length * 2;
-      m += bases.length + 1 + (farGhost ? 1 : 0) + extList.reduce((s, e) => s + e.meshes.length, 0);
+      let m = recs.length * 3 + bases.length + extList.reduce((s, e) => s + e.meshes.length, 0);
+      for (const c of chunks) m += c.parts.length;
       info.meshes = m;
       info.loaded = FIG_LOAD.loaded;
       info.baked = FIG_LOAD.total;
       return info;
     },
+    /** GPU bytes of every figure buffer (geometry, instance data, batches) and texture (PERF-PLAN 5.5). */
+    gpuMemory() {
+      const seen = new Set();
+      let buffers = 0;
+      let cpu = 0;
+      const addAttr = (a) => {
+        // Interleaved attributes share one buffer: count it once.
+        const d = a && a.isInterleavedBufferAttribute ? a.data : a;
+        if (d && !seen.has(d)) {
+          seen.add(d);
+          buffers += figAttrBytes(a);
+          if (d.array) cpu += d.array.byteLength;
+        }
+      };
+      const addMesh = (m) => {
+        const g = m.geometry;
+        for (const k in g.attributes) addAttr(g.attributes[k]);
+        addAttr(g.index);
+        if (m.isInstancedMesh) addAttr(m.instanceMatrix);
+      };
+      for (const r of recs) {
+        for (const m of r.meshes) if (m) addMesh(m);
+        if (r.depth) for (const m of r.depth) if (m) addMesh(m);
+      }
+      for (const b of bases) addMesh(b.mesh);
+      for (const m of outline) addAttr(m.instanceMatrix);
+      for (const m of warm) addMesh(m);
+      for (const e of extList) for (const m of e.meshes) addMesh(m);
+      for (const c of chunks) {
+        for (const p of c.parts) {
+          buffers += p.bytes;
+          if (keepCpu) cpu += p.bytes;
+        }
+      }
+      // CPU side also: the design LODs no mesh references (batch sources, float copies) and the transform texture.
+      for (const r of recs) {
+        const geo = figGeo(r.id);
+        for (const e of geo.lods) {
+          for (const k in e.geometry.attributes) {
+            const a = e.geometry.attributes[k];
+            if (!seen.has(a)) {
+              seen.add(a);
+              if (a.array) cpu += a.array.byteLength;
+            }
+          }
+          if (e.far && !seen.has(e.far)) {
+            seen.add(e.far);
+            cpu += e.far.pos.byteLength + e.far.nrm.byteLength;
+          }
+          for (const bs of [e.bsrcC, e.bsrcI]) {
+            if (bs && !seen.has(bs)) {
+              seen.add(bs);
+              cpu += bs.cpuBytes;
+            }
+          }
+        }
+      }
+      cpu += xf.data.byteLength;
+      const textures = xf.bytes + (figAtlasTex ? figAtlasTex.figBytes || 0 : 0);
+      return { buffers, textures, cpu };
+    },
+    /** Development diagnostics (PERF-PLAN 5.6). */
+    debug: {
+      /** Region batches on / off (off: every handle is drawn instanced; for comparisons). */
+      batching(on) {
+        batching = !!on;
+      },
+      forceLod(l) {
+        kit.setForceLod(l);
+      },
+      showRegions(on) {
+        showRegions(on);
+      },
+      stats() {
+        return {
+          ...figureRenderStats(),
+          tier, detail, viewH,
+          chunkList: chunks.filter((c) => c.parts.length || c.wantN).map((c) => ({
+            key: c.key, members: c.members ? c.members.length : 0, want: c.wantN, live: c.live, parts: c.parts.length, tris: c.parts.reduce((s, p) => s + p.tris, 0),
+            kb: Math.round(c.bytes / 1024), inView: c.inView, dist: +c.dist.toFixed(2), dirty: chunkDirty(c), compact: c.compact,
+            r: c.parts.length ? +Math.max(...c.parts.map((p) => p.sphere.radius)).toFixed(2) : 0,
+          })),
+        };
+      },
+      handle(h) {
+        const o = h * 4;
+        return {
+          mode: mode[h], lod: lod[h], fin: fin[h], still: still[h], cover: cover[h], focus: focus[h], dist: dist[h],
+          reg: [reg[o], reg[o + 1], reg[o + 2], reg[o + 3]], want: [want[o], want[o + 1], want[o + 2], want[o + 3]],
+          mem: [mem[o], mem[o + 1], mem[o + 2], mem[o + 3]], drawF: drawF[h], drawB: drawB[h], xf: xfState[h],
+        };
+      },
+    },
     dispose() {
       FIG_LOAD.listeners.delete(listener);
       scene.remove(group);
       for (const ms of meshes) {
-        ms.geometry.dispose();
+        figDisposeOwn(ms.geometry, FIG_SHARED_ATTRS);
         ms.dispose();
       }
-      for (const w of warm) {
-        w.geometry.dispose();
-        w.dispose();
-      }
-      far.dispose();
-      if (farGhost) farGhost.dispose();
+      for (const c of chunks) for (const p of c.parts) p.mesh.geometry.dispose();
+      warmInstGeo.dispose();
+      warmBatchGeo.dispose();
+      xf.tex.dispose();
+      if (FIG_STATS.kit === kit) FIG_STATS.kit = null;
     },
   };
+  FIG_STATS.kit = kit;
   return kit;
 }
 
@@ -1861,8 +3040,9 @@ function figFloatCopy(e) {
 /* ---- single-design instancer (preview, finale casting) ------------------------------------------- */
 
 /**
- * DESIGN.md 16.5 low-level instancer: full-detail figure (+ base) of one design, capacity maxCount.
- * setInstance(i, matrix) takes a pose-space -> world matrix (base bottom centre).
+ * DESIGN.md 16.5 low-level instancer: full-detail figure (+ base) of one design, capacity maxCount; opts.lod 1 draws
+ * the mid LOD instead (finale casting below the Magas tier). setInstance(i, matrix) takes a pose-space -> world matrix
+ * (base bottom centre).
  */
 function createFigureInstancer(scene, designId, maxCount, opts = { withBase: true }) {
   initFigureMaterials();
@@ -1874,16 +3054,18 @@ function createFigureInstancer(scene, designId, maxCount, opts = { withBase: tru
   const local = new THREE.Matrix4();
   const inst = figInstAttr(cap, 4);
   const geo = figGeo(designId);
+  const lodI = opts.lod === 1 ? 1 : 0;
   let met = getFigureMetrics(designId);
-  figLocalMatrix(geo.lods[0], met.baseH, local);
-  const fig = figInstanced(figInstGeometry(geo.lods[0].geometry, { figInst: inst }), d.translucent ? FIG_MATERIALS.glass : FIG_MATERIALS.figure, cap);
+  figLocalMatrix(geo.lods[lodI], met.baseH, local);
+  const figMat = d.translucent ? FIG_MATERIALS.glass : lodI ? FIG_MATERIALS.figureLod : FIG_MATERIALS.figure;
+  const fig = figInstanced(figInstGeometry(geo.lods[lodI].geometry, { figInst: inst }), figMat, cap);
   fig.name = `fig:instancer:${designId}`;
   const meshes = [fig];
   let depth = null;
   if (d.translucent) {
     // Same depth pre-pass as in the kit (see figGhostDepthMaterial).
     fig.renderOrder = 2;
-    depth = figInstanced(fig.geometry, figGhostDepthMaterial(), 1);
+    depth = figInstanced(fig.geometry, figGhostDepthMaterial(false), 1);
     depth.instanceMatrix = fig.instanceMatrix;
     depth.renderOrder = 1;
     depth.name = `fig:instancer-depth:${designId}`;
@@ -1896,7 +3078,7 @@ function createFigureInstancer(scene, designId, maxCount, opts = { withBase: tru
     const cat = FIG_CATEGORIES[FIG_CATEGORY_INDEX[d.category]];
     figCol1.set(cat ? cat.color : '#8e8169').convertSRGBToLinear();
     for (let i = 0; i < cap; i++) baseCat.setXYZW(i, figCol1.r, figCol1.g, figCol1.b, cat ? cat.index : 0);
-    base = figInstanced(figInstGeometry(figBuildBase(0).geometry, { figBaseCat: baseCat, figInst: figInstAttr(cap, 4) }), FIG_MATERIALS.base, cap);
+    base = figInstanced(figInstGeometry(figBuildBase(lodI).geometry, { figBaseCat: baseCat, figInst: figInstAttr(cap, 4) }), lodI ? FIG_MATERIALS.baseLod : FIG_MATERIALS.base, cap);
     base.name = `fig:instancer-base:${designId}`;
     meshes.push(base);
   }
@@ -1917,11 +3099,12 @@ function createFigureInstancer(scene, designId, maxCount, opts = { withBase: tru
     onDesignLoaded(id) {
       if (id !== designId) return;
       met = getFigureMetrics(designId);
-      figLocalMatrix(geo.lods[0], met.baseH, local);
+      figLocalMatrix(geo.lods[lodI], met.baseH, local);
       const old = fig.geometry;
-      fig.geometry = figInstGeometry(geo.lods[0].geometry, { figInst: inst });
+      fig.geometry = figInstGeometry(geo.lods[lodI].geometry, { figInst: inst });
       if (depth) depth.geometry = fig.geometry;
-      old.dispose();
+      // The instance attribute moves to the new geometry: only the old shared attributes are detached.
+      figDisposeOwn(old, [...FIG_SHARED_ATTRS, 'figInst']);
       writeAll();
     },
   };
@@ -1952,10 +3135,15 @@ function createFigureInstancer(scene, designId, maxCount, opts = { withBase: tru
     },
     dispose() {
       FIG_LOAD.listeners.delete(listener);
-      for (const m of meshes) {
-        scene.remove(m);
-        m.geometry.dispose();
-        m.dispose();
+      for (const m of meshes) scene.remove(m);
+      // The design and base geometries are shared with the kit (their CPU arrays may be released): dispose only
+      // this instancer's own instance attributes and vertex arrays.
+      figDisposeOwn(fig.geometry, FIG_SHARED_ATTRS);
+      fig.dispose();
+      if (depth) depth.dispose();
+      if (base) {
+        figDisposeOwn(base.geometry, FIG_SHARED_ATTRS);
+        base.dispose();
       }
     },
   };
@@ -2037,18 +3225,24 @@ async function loadExternalFigure(designId) {
 
 /* ---- the free-flying Snitch ------------------------------------------------------------------------ */
 
-/** DESIGN.md 16.5: walnut-sized polished gold ball with two fluttering feather wings (2 draws, no base). */
+/**
+ * DESIGN.md 16.5: walnut-sized polished gold ball with two fluttering feather wings (2 draws, no base). The gold is
+ * Physical (clearcoat) only on the Magas tier; the translucent wings render in a single pass (PERF-PLAN F8).
+ */
 function createSnitchFlyer(scene) {
   const group = new THREE.Group();
   group.name = 'fig:snitch';
   // Modelled at the original statuette scale; follows the global figurine scale like every other figure.
   group.scale.setScalar(FIG_SCALE);
-  const gold = new THREE.MeshPhysicalMaterial({ color: 0xe0b24a, metalness: 1, roughness: 0.16, clearcoat: 0.6, emissive: 0x3a2606, emissiveIntensity: 0.6 });
+  const goldPhys = new THREE.MeshPhysicalMaterial({ color: 0xe0b24a, metalness: 1, roughness: 0.16, clearcoat: 0.6, emissive: 0x3a2606, emissiveIntensity: 0.6 });
+  const goldStd = new THREE.MeshStandardMaterial({ color: 0xe0b24a, metalness: 1, roughness: 0.16, emissive: 0x3a2606, emissiveIntensity: 0.6 });
+  goldPhys.name = 'fig:snitch-gold-phys';
+  goldStd.name = 'fig:snitch-gold';
   const R = 0.017;
   const ballGeo = new THREE.SphereGeometry(R, 24, 16);
   const seam1 = new THREE.TorusGeometry(R * 1.01, R * 0.05, 6, 32);
   const seam2 = seam1.clone().rotateY(Math.PI / 2);
-  const ball = new THREE.Mesh(mergeGeometries([ballGeo, seam1, seam2].map((g) => (g.index ? g.toNonIndexed() : g)), false), gold);
+  const ball = new THREE.Mesh(mergeGeometries([ballGeo, seam1, seam2].map((g) => (g.index ? g.toNonIndexed() : g)), false), figTierId(FIG_MATERIALS.quality) === 'magas' ? goldPhys : goldStd);
   group.add(ball);
   /* Feather wing: a curved blade with scalloped trailing edge, ribs from vertex shading */
   const shape = new THREE.Shape();
@@ -2064,6 +3258,8 @@ function createSnitchFlyer(scene) {
   }
   const wingGeo = new THREE.ShapeGeometry(shape, 6);
   const wingMat = new THREE.MeshStandardMaterial({ color: 0xf6ecd2, metalness: 0.35, roughness: 0.35, side: THREE.DoubleSide, transparent: true, opacity: 0.88, emissive: 0x2a2008 });
+  wingMat.forceSinglePass = true;
+  wingMat.name = 'fig:snitch-wing';
   const wingL = new THREE.Mesh(wingGeo, wingMat);
   const wingR = new THREE.Mesh(wingGeo, wingMat);
   const pivotL = new THREE.Group();
@@ -2075,21 +3271,626 @@ function createSnitchFlyer(scene) {
   pivotR.add(wingR);
   group.add(pivotL, pivotR);
   scene.add(group);
-  return {
+  const flyer = {
     object3D: group,
     update(t, flapping = true) {
       const a = flapping ? 0.25 + 0.55 * Math.sin(t * 62) : 0.5;
       pivotL.rotation.set(-0.35, 0.25, a);
       pivotR.rotation.set(-0.35, -0.25, -a);
     },
+    setQuality(q) {
+      ball.material = figTierId(q) === 'magas' ? goldPhys : goldStd;
+    },
     dispose() {
+      const i = figSnitchList.indexOf(flyer);
+      if (i >= 0) figSnitchList.splice(i, 1);
       scene.remove(group);
       ball.geometry.dispose();
       wingGeo.dispose();
-      gold.dispose();
+      goldPhys.dispose();
+      goldStd.dispose();
       wingMat.dispose();
     },
   };
+  figSnitchList.push(flyer);
+  return flyer;
+}
+
+/* ---- 27-figures-perf.js ---- */
+/* ==== 27-figures-perf.js — figure performance layer (PERF-PLAN.md 2.4, F1-F7, F11): quality tiers and the
+   pixel-height LOD table, the per-handle transform / effect texture, the batch sources (mid and far LODs and the bases
+   in the batch vertex layout), region batches (static figurines merged per pile sector, shelf section, tower or floor
+   cell: one draw each, culled by a real bounding sphere) and the figure render statistics. The kit (24) drives it. ==== */
+
+/** Quality tier ids in ascending cost (PERF-PLAN 2.1). */
+const FIG_TIER_IDS = ['mento', 'xbox', 'kozepes', 'magas'];
+
+/**
+ * Pixel-height LOD per tier (PERF-PLAN 2.4). hPx = projected height of the whole figurine (base included) at the
+ * scale-1 drawing-buffer height. t0 / t1: LOD0 / LOD1 from this height (Mentő: LOD0 only for the held, aimed and cast
+ * figures); max0: LOD0 instances (farthest demoted first); max1: mid-LOD instances drawn instanced (moving figurines;
+ * static ones use the region batches); tris: figure triangle budget per frame (both thresholds rise by 10 % per frame
+ * while it is exceeded and fall back by 2 % per frame); cover1: LOD cap of a pile figurine with something on it
+ * (1 = at most LOD1, 2 = far with its base). A figurine under a covered one is far, or LOD1 from FIG_PERF.cover2Up × t0
+ * where cover1 is 1 (integration: zoomed piles showed faceted far bases and blocky robes); cover2NoBase also drops
+ * its base (Mentő only: in the porous piles the base discs of buried figurines stay visible between the others).
+ * budgetMs: region-batch rebuild time per frame; minH: the pixel heights are measured at least at this buffer height
+ * (the Xbox boots at 720p on a 1080p TV: geometry detail stays as at 1080p, the triangle budget still applies);
+ * ppMid / ppFar (integration): batched figurines at least this tall (px, mid / far LOD) are shaded per pixel, smaller ones
+ * per vertex (figureBatchVlit; 0 = per pixel only, as before; Infinity = per vertex only). Közepes: an invisible saving
+ * of about 5-10 % GPU on the weak-GPU proxy; Mentő: all per vertex (about 20-25 %, a visible loss of gloss on large
+ * figurines, accepted on the rescue tier); Xbox and Magas: per pixel (the Series X GPU has the headroom, and the twin
+ * draws would cost CPU there). The thresholds are tuned down from the plan's starting values
+ * (Xbox 300 / 90 px) to about where the old distance LOD switched at 1080p: at 300 / 90 px the shelf close-up lost the
+ * scarf stripes and faces (full detail ended at 0.75 m) and pile figurines turned far at 1.5 m (decision 14).
+ */
+const FIG_TIER = {
+  mento: { t0: Infinity, t1: 110, max0: 2, max1: 40, tris: 350000, cover1: 2, cover2NoBase: true, budgetMs: 1.5, minH: 0, ppMid: Infinity, ppFar: Infinity },
+  xbox: { t0: 200, t1: 60, max0: 24, max1: 160, tris: 750000, cover1: 1, cover2NoBase: false, budgetMs: 2, minH: 1080, ppMid: 0, ppFar: 0 },
+  kozepes: { t0: 180, t1: 52, max0: 32, max1: 220, tris: 1000000, cover1: 1, cover2NoBase: false, budgetMs: 2, minH: 0, ppMid: 140, ppFar: 80 },
+  magas: { t0: 150, t1: 45, max0: 64, max1: 320, tris: 1600000, cover1: 1, cover2NoBase: false, budgetMs: 2.5, minH: 0, ppMid: 0, ppFar: 0 },
+};
+/**
+ * hyst: LOD hysteresis (± share of the threshold); aimT0: the aimed figure's LOD0 height; still: frames a pose must
+ * hold to be batched; maxVerts: vertices per batch part (u16 indices); prefetch: a figurine joins its mid batch from
+ * this share of the mid upgrade height on (a small margin: every prefetched member costs collapsed vertices);
+ * minRebuildS / minRebuildFarS: minimum age of a mid / far batch before it is rebuilt for new members that another
+ * batch can still draw meanwhile (at the old LOD; members nothing can draw rebuild at once);
+ * compactS / compactTris / compactShare: a batch older than compactS that holds more than compactTris triangles and
+ * more than compactShare of its triangles for members it keeps only lazily (no longer wanted), or keeps half its
+ * members lazily, drops them (compactFastS / compactFastTris: sooner when that waste is large, e.g. after a jump or a
+ * zoom); keepDynS: a member that moves stays in its batch this long while inside it; gridM: floor cell size without a
+ * world resolver.
+ */
+const FIG_PERF = {
+  hyst: 0.12, aimT0: 300, still: 10, maxVerts: 60000, prefetch: 0.9, minRebuildS: 0.5, minRebuildFarS: 0.5, compactS: 0.75,
+  compactTris: 10000, compactShare: 0.2, compactFastS: 0.25, compactFastTris: 60000, keepDynS: 2, gridM: 3,
+  // Batch part capacity (F2): headroom of a new part, and the least share of its capacity a rebuild must fill to reuse it.
+  capGrow: 1.2, capShrink: 0.4,
+  // A pile figurine buried two deep is drawn at LOD1 instead of far from this share of t0 (integration, decision 14).
+  cover2Up: 0.7,
+};
+/** Batch kinds per region: opaque mid / far (figures with their bases; for translucent designs only the bases) and
+ *  translucent mid / far (per region group). Their LOD class and translucency: */
+const FIG_KIND_MID = 0;
+const FIG_KIND_FAR = 1;
+const FIG_KIND_GMID = 2;
+const FIG_KIND_GFAR = 3;
+const FIG_KIND_CLS = [1, 2, 1, 2];
+const FIG_KIND_GHOST = [false, false, true, true];
+
+/** Maps a tier id or a legacy preset name ('xbox' / 'magas') to a tier id; anything unknown is the PC default. */
+function figTierId(q) {
+  return FIG_TIER[q] ? q : 'kozepes';
+}
+
+/* ---- render statistics ---------------------------------------------------------------------------------------- */
+
+/** Filled by the kit every frame (PERF-PLAN 5.2 / F4). */
+const FIG_STATS = {
+  draws: 0, tris: 0, lod0: 0, lod1: 0, far: 0, batched: 0, covered: 0, culled: 0, regionRebuilds: 0, reused: 0, rebuildMs: 0, xfRows: 0,
+  uploadBytesFrame: 0, reasons: {}, liveTris: 0, chunks: 0, chunksInView: 0, chunkTris: 0, instTris: 0, dirtyChunks: 0, adapt: 1, updateMs: 0, kit: null,
+};
+
+/**
+ * PERF-PLAN 5.2: figure draw calls and triangles of the last frame (true counts: drawn instances plus the index ranges
+ * of the region batches in view), LOD counts, batched / covered / culled handles, region rebuilds (total) and the last
+ * frame's rebuild time, GPU bytes of every figure buffer and texture, bytes uploaded last frame, the figure programs.
+ */
+function figureRenderStats() {
+  const k = FIG_STATS.kit;
+  const mem = k && k.gpuMemory ? k.gpuMemory() : { buffers: 0, textures: 0, cpu: 0 };
+  const programs = [];
+  for (const key of ['figure0', 'figureLod', 'figureBatchVlit', 'figureBatchPP', 'base0', 'baseLod', 'glass', 'glassBatch', 'ghostDepth', 'ghostDepthBatch', 'outline']) {
+    if (key === 'figureBatchVlit' && !FIG_MATERIALS.figureBatchVlitOn) continue;
+    const m = FIG_MATERIALS[key];
+    if (m && !programs.includes(m.name)) programs.push(m.name);
+  }
+  return {
+    draws: FIG_STATS.draws, tris: FIG_STATS.tris, lod0: FIG_STATS.lod0, lod1: FIG_STATS.lod1, far: FIG_STATS.far,
+    batched: FIG_STATS.batched, covered: FIG_STATS.covered, culled: FIG_STATS.culled, regionRebuilds: FIG_STATS.regionRebuilds, reused: FIG_STATS.reused,
+    rebuildMs: +FIG_STATS.rebuildMs.toFixed(2), gpuBytes: mem.buffers + mem.textures, gpuBufferBytes: mem.buffers,
+    gpuTextureBytes: mem.textures, cpuBytes: mem.cpu, uploadBytesFrame: FIG_STATS.uploadBytesFrame, programs,
+    chunks: FIG_STATS.chunks, chunksInView: FIG_STATS.chunksInView, chunkTris: FIG_STATS.chunkTris, instTris: FIG_STATS.instTris,
+    drawnTris: FIG_STATS.liveTris,
+    dirtyChunks: FIG_STATS.dirtyChunks, adapt: +FIG_STATS.adapt.toFixed(3), updateMs: +FIG_STATS.updateMs.toFixed(3),
+  };
+}
+
+/* ---- per-handle transform / effect texture -------------------------------------------------------------------- */
+
+/** Handles per texture row and texels per handle (the batch shader in 23-figures-mat.js hard-codes 32 and 16). */
+const FIG_XF_HPR = 32;
+const FIG_XF_TPH = 16;
+
+/**
+ * Partial texture upload hook, set by the game (90-main.js: texSubImage2D on three's own texture object):
+ * fn(texture, data, width, firstRow, rows) → true when done, false when the texture is not on the GPU yet (then the
+ * whole texture uploads through three). The figure preview has none.
+ */
+const FIG_XF_UPLOAD = { fn: null };
+
+/**
+ * RGBA32F texture with 16 texels per handle: matrix rows of the 4 batch parts (far figure 0-2, far base 3-5, mid
+ * figure 6-8, mid base 9-11), effects (12), the category (13) and the shading path (14.x: 0 per vertex, 1 per pixel).
+ * Rows are written for the parts a region batch draws and zeroed otherwise (the batch then collapses them), so an LOD
+ * switch between batches is a row toggle.
+ */
+function figCreateXf(n) {
+  const w = FIG_XF_HPR * FIG_XF_TPH;
+  const h = Math.max(1, Math.ceil(n / FIG_XF_HPR));
+  const data = new Float32Array(w * h * 4);
+  const tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat, THREE.FloatType);
+  tex.name = 'fig:xf';
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  const off = (hd, k) => (Math.floor(hd / FIG_XF_HPR) * w + (hd % FIG_XF_HPR) * FIG_XF_TPH + k) * 4;
+  // Dirty row range (F3): a pulsing legendary or the aim rim changes one handle's effects texel every frame; only the
+  // rows (32 handles, 8 KB each) that changed upload, not the whole 196 KB texture.
+  // Dirty rows are kept one by one: the pulsing legendaries are spread over the whole texture, so a min-max range
+  // was nearly all of it.
+  const rowDirty = new Uint8Array(h);
+  let nDirty = 0;
+  const mark = (hd) => {
+    const r = Math.floor(hd / FIG_XF_HPR);
+    if (!rowDirty[r]) {
+      rowDirty[r] = 1;
+      nDirty++;
+    }
+    xf.dirty = true;
+  };
+  const xf = {
+    tex, data, dirty: false, full: true, bytes: w * h * 16,
+    /** Writes the three affine rows of a THREE.Matrix4 (column-major elements) for a part (0-3, see above). */
+    rows(hd, part, e) {
+      let o = off(hd, part * 3);
+      for (let r = 0; r < 3; r++, o += 4) {
+        data[o] = e[r];
+        data[o + 1] = e[4 + r];
+        data[o + 2] = e[8 + r];
+        data[o + 3] = e[12 + r];
+      }
+      mark(hd);
+    },
+    zero(hd) {
+      const o = off(hd, 0);
+      data.fill(0, o, o + 48);
+      mark(hd);
+    },
+    fx(hd, a, b, c, d) {
+      const o = off(hd, 12);
+      if (data[o] === a && data[o + 1] === b && data[o + 2] === c && data[o + 3] === d) return;
+      data[o] = a;
+      data[o + 1] = b;
+      data[o + 2] = c;
+      data[o + 3] = d;
+      mark(hd);
+    },
+    /** Shading path of a batched handle: 0 = the per-vertex lit draw, 1 = the per-pixel twin draw. */
+    mode(hd, v) {
+      data[off(hd, 14)] = v;
+      mark(hd);
+    },
+    cat(hd, r, g, b, i) {
+      const o = off(hd, 13);
+      data[o] = r;
+      data[o + 1] = g;
+      data[o + 2] = b;
+      data[o + 3] = i;
+      mark(hd);
+    },
+    /** Uploads what changed (the dirty rows, or everything after a restore); returns the uploaded bytes. */
+    flush() {
+      if (!xf.dirty) return 0;
+      xf.dirty = false;
+      const n = nDirty;
+      nDirty = 0;
+      let ok = !xf.full && n > 0 && n < h * 0.5 && !!FIG_XF_UPLOAD.fn;
+      let rows = 0;
+      // Runs of consecutive dirty rows, one sub-upload each.
+      for (let r = 0; r < h; r++) {
+        if (!rowDirty[r]) continue;
+        let e = r;
+        while (e + 1 < h && rowDirty[e + 1]) e++;
+        for (let k = r; k <= e; k++) rowDirty[k] = 0;
+        if (ok) {
+          try {
+            ok = FIG_XF_UPLOAD.fn(tex, data, w, r, e - r + 1);
+          } catch {
+            ok = false;
+          }
+          rows += e - r + 1;
+        }
+        r = e;
+      }
+      if (ok) {
+        FIG_STATS.xfRows += rows;
+        return rows * w * 16;
+      }
+      xf.full = false;
+      tex.needsUpdate = true;
+      return xf.bytes;
+    },
+  };
+  return xf;
+}
+
+/* ---- batch sources ------------------------------------------------------------------------------------------- */
+
+/**
+ * One LOD of a design (or base) in the batch vertex layout: u16 positions normalised inside a box (D = the
+ * dequantisation, folded into the handle's matrix rows), oct normals, paint, PBR bytes and the index. Normals are
+ * prepared so that the batch shader (three's instanced-normal formula on matrix x D) reproduces exactly what the
+ * instanced path draws for this entry (`correct` = true: the true normals, as the old far batch drew them).
+ */
+function figBatchSource(entry, correct) {
+  const slot = correct ? 'bsrcC' : 'bsrcI';
+  if (entry[slot]) return entry[slot];
+  const g = entry.geometry;
+  const p = g.attributes.position;
+  const nV = p.count;
+  const oct = g.attributes.aOct.array;
+  let pos;
+  let D;
+  let inst = [1, 1, 1];
+  // Stride of the position records: 4 for the padded baked figures, 3 for the quantised float meshes below.
+  let ps = 3;
+  if (p.normalized && p.array instanceof Uint16Array) {
+    pos = p.array;
+    ps = p.itemSize;
+    D = entry.dequant;
+    inst = [D.elements[0], D.elements[5], D.elements[10]];
+  } else {
+    // Float positions (bases, placeholders): quantise into their bounding box.
+    const src = p.array;
+    const mn = [Infinity, Infinity, Infinity];
+    const mx = [-Infinity, -Infinity, -Infinity];
+    for (let v = 0; v < nV; v++) {
+      for (let c = 0; c < 3; c++) {
+        const x = src[v * 3 + c];
+        if (x < mn[c]) mn[c] = x;
+        if (x > mx[c]) mx[c] = x;
+      }
+    }
+    for (let c = 0; c < 3; c++) if (mx[c] - mn[c] < 1e-6) mx[c] = mn[c] + 1e-6;
+    pos = new Uint16Array(nV * 3);
+    for (let v = 0; v < nV; v++) {
+      for (let c = 0; c < 3; c++) pos[v * 3 + c] = Math.round(((src[v * 3 + c] - mn[c]) / (mx[c] - mn[c])) * 65535);
+    }
+    D = new THREE.Matrix4().makeTranslation(mn[0], mn[1], mn[2]).multiply(new THREE.Matrix4().makeScale(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]));
+  }
+  const ds = [D.elements[0], D.elements[5], D.elements[10]];
+  // Wanted world normal: R n (correct) or R inst^-1 n (instanced look). The batch gives R D^-1 n', so n' = D x wanted.
+  const f = correct ? ds : [ds[0] / inst[0], ds[1] / inst[1], ds[2] / inst[2]];
+  let octOut = oct;
+  if (Math.abs(f[0] - f[1]) > 1e-9 * f[0] || Math.abs(f[0] - f[2]) > 1e-9 * f[0]) {
+    octOut = new Int16Array(nV * 2);
+    const tmp = [0, 0, 0];
+    for (let v = 0; v < nV; v++) {
+      figOctDecode(oct[v * 2], oct[v * 2 + 1], tmp, 0);
+      figOctEncode(tmp[0] * f[0], tmp[1] * f[1], tmp[2] * f[2], octOut, v * 2);
+    }
+  }
+  const index = g.index.array;
+  const pbr = figBatchCurvature(pos, ps, D, oct, index, g.attributes.aPbr.array, nV);
+  const out = {
+    pos, ps, oct: octOut, col: g.attributes.aCol.array, pbr, index, nv: nV, ni: index.length, D,
+    tris: index.length / 3, cpuBytes: (pos !== p.array ? pos.byteLength : 0) + (octOut !== oct ? octOut.byteLength : 0) + pbr.byteLength,
+  };
+  entry[slot] = out;
+  return out;
+}
+
+/**
+ * A copy of the PBR bytes with the clearcoat byte (unused by the Standard batch materials) replaced by the surface
+ * curvature at the vertex: the largest normal angle per metre (world, scale 1) along its edges, / 4, up to 255. The
+ * per-vertex lit batch shader multiplies it by the pixel footprint to reproduce three's per-pixel specular
+ * anti-aliasing (geometryRoughness = normal change per pixel): flat parts stay glossy, creases and coarse LODs rough.
+ */
+function figBatchCurvature(pos, ps, D, oct, index, srcPbr, nV) {
+  const pbr = new Uint8Array(srcPbr.subarray(0, nV * 4));
+  const e = D.elements;
+  const curv = new Float32Array(nV);
+  const na = [0, 0, 0];
+  const nb = [0, 0, 0];
+  const k = 1 / 65535;
+  const edge = (a, b) => {
+    const dx = (pos[a * ps] - pos[b * ps]) * k * e[0];
+    const dy = (pos[a * ps + 1] - pos[b * ps + 1]) * k * e[5];
+    const dz = (pos[a * ps + 2] - pos[b * ps + 2]) * k * e[10];
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz) * FIG_CM;
+    if (len < 1e-6) return;
+    figOctDecode(oct[a * 2], oct[a * 2 + 1], na, 0);
+    figOctDecode(oct[b * 2], oct[b * 2 + 1], nb, 0);
+    const c = Math.acos(Math.max(-1, Math.min(1, na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2]))) / len;
+    if (c > curv[a]) curv[a] = c;
+    if (c > curv[b]) curv[b] = c;
+  };
+  for (let t = 0; t + 2 < index.length; t += 3) {
+    const a = index[t];
+    const b = index[t + 1];
+    const c = index[t + 2];
+    edge(a, b);
+    edge(b, c);
+    edge(c, a);
+  }
+  for (let v = 0; v < nV; v++) pbr[v * 4 + 2] = Math.min(255, Math.round(curv[v] / 4));
+  return pbr;
+}
+
+/* ---- region chunks -------------------------------------------------------------------------------------------- */
+
+/** Integer mixing for the order-independent chunk content signatures. */
+function figMix(a) {
+  let x = a | 0;
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  return x ^ (x >>> 16);
+}
+
+/** Fallback region key (no world resolver, e.g. the figure preview): 3 m floor cells. */
+function figGridKey(x, z) {
+  return `g${Math.floor(x / FIG_PERF.gridM)}_${Math.floor(z / FIG_PERF.gridM)}`;
+}
+
+/**
+ * A region chunk of one kind (FIG_KIND_*): up to a few mesh parts (each below 65,536 vertices, u16 indices) of the same
+ * material. want* / built* are order-independent signatures of the wanted and the built entries; adds = wanted entries
+ * not built yet, urgent = of those, entries whose handle no batch can draw yet; live = members it draws this frame.
+ */
+function figNewChunk(id, key, kind) {
+  return {
+    id, key, kind, parts: [], members: null, builtA: 0, builtB: 0, builtN: 0, wantA: 0, wantB: 0, wantN: 0, adds: 0, urgent: 0,
+    live: 0, lazy: 0, lazyTris: 0, liveTris: 0, tris: 0, compact: false, force: false, head: -1, lastBuild: -1e9, inView: false, dist: 0, bytes: 0,
+  };
+}
+
+/**
+ * Time-sliced build of a chunk's mesh parts from its entry list (entry e = handle * 4 + kind, linked through nextE).
+ * The entries are snapshotted at once: entryOf(h, out) fills out = { fig: source | null, base: source | null };
+ * figPart / basePart are the transform-texture parts (0-3) of the figure and the base in this batch. step(deadline)
+ * copies members until performance.now() passes the deadline (at least one member per call) and returns true when
+ * done; finish(centers) computes each part's bounding sphere from the current centres (x, y, z, r) and returns
+ * { parts: [{ A, nv, ni, cap, reuse, tris, sphere, bytes, usedBytes }], handles, partOf, baseOf } (per member: part
+ * index, base built). The kit turns a part into a geometry (figBatchGeometry) or writes it into the chunk's existing
+ * part geometry (figBatchUpdate).
+ *
+ * caps[i] = { nv, ni }: capacity of the chunk's current part i (F2). A new part that fits (and fills at least
+ * FIG_PERF.capShrink of it) is built at exactly that capacity, so the kit can swap its arrays into the existing GL
+ * buffers (bufferSubData of the used range) instead of a new geometry per rebuild; a new or outgrown part gets
+ * FIG_PERF.capGrow headroom. The vertex record is interleaved u16x4: position xyz plus the handle id in w (XB-7).
+ */
+function figChunkJob(head, nextE, count, entryOf, keepCpu, figPart, basePart, caps = []) {
+  const handles = new Int32Array(count);
+  const partOf = new Int32Array(count);
+  const baseOf = new Uint8Array(count);
+  const ent = { fig: null, base: null };
+  const parts = [];
+  let cur = null;
+  let k = 0;
+  for (let e = head; e >= 0; e = nextE[e]) {
+    const h = e >> 2;
+    entryOf(h, ent);
+    const nv = (ent.fig ? ent.fig.nv : 0) + (ent.base ? ent.base.nv : 0);
+    const ni = (ent.fig ? ent.fig.ni : 0) + (ent.base ? ent.base.ni : 0);
+    if (!nv) continue;
+    if (!cur || cur.nv + nv > FIG_PERF.maxVerts) {
+      cur = { list: [], nv: 0, ni: 0, arrays: null, i: 0, vo: 0, io: 0, cap: null, reuse: false };
+      parts.push(cur);
+    }
+    cur.list.push(h, ent.fig, ent.base);
+    cur.nv += nv;
+    cur.ni += ni;
+    handles[k] = h;
+    partOf[k] = parts.length - 1;
+    baseOf[k] = ent.base ? 1 : 0;
+    k++;
+  }
+  let pi = 0;
+  const job = {
+    bytes: 0,
+    step(deadline) {
+      let first = true;
+      while (pi < parts.length) {
+        const p = parts[pi];
+        if (!p.arrays) {
+          const c = caps[pi];
+          p.reuse = !!c && c.nv >= p.nv && c.ni >= p.ni && p.nv >= c.nv * FIG_PERF.capShrink;
+          const cv = p.reuse ? c.nv : Math.min(65536, figCapStep(p.nv * FIG_PERF.capGrow));
+          const ci = p.reuse ? c.ni : figCapStep(p.ni * FIG_PERF.capGrow);
+          p.cap = { nv: cv, ni: ci };
+          p.arrays = {
+            ph: figPoolTake(Uint16Array, cv * 4), oct: figPoolTake(Int16Array, cv * 2), col: figPoolTake(Uint8Array, cv * 4),
+            pbr: figPoolTake(Uint8Array, cv * 4), idx: figPoolTake(Uint16Array, ci),
+          };
+        }
+        const A = p.arrays;
+        const L = p.list;
+        while (p.i < L.length) {
+          if (!first && performance.now() > deadline) return false;
+          first = false;
+          const h = L[p.i];
+          for (let part = 0; part < 2; part++) {
+            const s = part === 0 ? L[p.i + 1] : L[p.i + 2];
+            if (!s) continue;
+            const vo = p.vo;
+            const hid = h * 4 + (part === 0 ? figPart : basePart);
+            const sp = s.pos;
+            const st = s.ps;
+            const ph = A.ph;
+            for (let v = 0, j = 0, o = vo * 4; v < s.nv; v++, j += st, o += 4) {
+              ph[o] = sp[j];
+              ph[o + 1] = sp[j + 1];
+              ph[o + 2] = sp[j + 2];
+              ph[o + 3] = hid;
+            }
+            A.oct.set(s.oct, vo * 2);
+            A.col.set(s.col.subarray(0, s.nv * 4), vo * 4);
+            A.pbr.set(s.pbr.subarray(0, s.nv * 4), vo * 4);
+            const si = s.index;
+            const idx = A.idx;
+            const io = p.io;
+            for (let j = 0; j < si.length; j++) idx[io + j] = si[j] + vo;
+            p.vo += s.nv;
+            p.io += si.length;
+          }
+          p.i += 3;
+        }
+        pi++;
+      }
+      return true;
+    },
+    finish(centers) {
+      const out = [];
+      for (const p of parts) {
+        const L = p.list;
+        let sx = 0;
+        let sy = 0;
+        let sz = 0;
+        for (let i = 0; i < L.length; i += 3) {
+          const h = L[i];
+          sx += centers[h * 4];
+          sy += centers[h * 4 + 1];
+          sz += centers[h * 4 + 2];
+        }
+        const nm = L.length / 3;
+        const sphere = new THREE.Sphere(new THREE.Vector3(sx / nm, sy / nm, sz / nm), 0);
+        let r = 0;
+        for (let i = 0; i < L.length; i += 3) {
+          const h = L[i];
+          const dx = centers[h * 4] - sphere.center.x;
+          const dy = centers[h * 4 + 1] - sphere.center.y;
+          const dz = centers[h * 4 + 2] - sphere.center.z;
+          r = Math.max(r, Math.sqrt(dx * dx + dy * dy + dz * dz) + centers[h * 4 + 3]);
+        }
+        sphere.radius = r;
+        out.push({
+          A: p.arrays, nv: p.nv, ni: p.ni, cap: p.cap, reuse: p.reuse, tris: p.ni / 3, sphere,
+          bytes: p.cap.nv * FIG_BATCH_VB + p.cap.ni * 2, usedBytes: p.nv * FIG_BATCH_VB + p.ni * 2,
+        });
+      }
+      return { parts: out, handles: handles.subarray(0, k), partOf: partOf.subarray(0, k), baseOf: baseOf.subarray(0, k) };
+    },
+  };
+  return job;
+}
+
+/** Bytes per region-batch vertex: position + handle (u16x4), octahedral normal (i16x2), paint and PBR (u8x4 each). */
+const FIG_BATCH_VB = 8 + 4 + 4 + 4;
+
+/**
+ * Pool of region-batch staging arrays (XB-1 / F2): a rebuilt part of the same capacity takes the arrays its last build
+ * gave back after their upload, instead of new ones. About 18 rebuilds a second while walking otherwise left several
+ * MB of dead ArrayBuffers per second for the garbage collector (their memory only returns at the next GC).
+ */
+const FIG_POOL = { map: new Map(), bytes: 0, max: 6 * 1048576, hits: 0, misses: 0 };
+
+/** Capacity steps of new batch parts: quarter octaves from 1024 (19 % apart), so pooled arrays fit other parts too. */
+function figCapStep(n) {
+  let c = 1024;
+  let i = 0;
+  while (c < n) c = Math.round(1024 * 2 ** (++i / 4));
+  return c;
+}
+
+function figPoolKey(Ctor, n) {
+  return `${Ctor === Uint16Array ? 'u16' : Ctor === Int16Array ? 'i16' : 'u8'}:${n}`;
+}
+
+/** A staging array of `n` elements (stale contents: the job overwrites the used range, the rest is never drawn). */
+function figPoolTake(Ctor, n) {
+  const list = FIG_POOL.map.get(figPoolKey(Ctor, n));
+  if (list && list.length) {
+    const a = list.pop();
+    FIG_POOL.bytes -= a.byteLength;
+    FIG_POOL.hits++;
+    return a;
+  }
+  FIG_POOL.misses++;
+  return new Ctor(n);
+}
+
+function figPoolGive(a) {
+  if (!a || FIG_POOL.bytes + a.byteLength > FIG_POOL.max) return;
+  const Ctor = a instanceof Uint16Array ? Uint16Array : a instanceof Int16Array ? Int16Array : a instanceof Uint8Array ? Uint8Array : null;
+  if (!Ctor) return;
+  const k = figPoolKey(Ctor, a.length);
+  let list = FIG_POOL.map.get(k);
+  if (!list) FIG_POOL.map.set(k, (list = []));
+  list.push(a);
+  FIG_POOL.bytes += a.byteLength;
+}
+
+/** onUpload callback of the batch buffers without CPU copies: the array goes back to the pool once the GPU has it. */
+function figPoolRelease() {
+  this.figUp = true;
+  if (this.array) {
+    this.figBytes = this.array.byteLength;
+    figPoolGive(this.array);
+  }
+  this.array = null;
+}
+
+/** Every buffer of a batch geometry (the interleaved record once). */
+function figBatchBuffers(g) {
+  return [g.attributes.position.data, g.attributes.aOct, g.attributes.aCol, g.attributes.aPbr, g.index];
+}
+
+/** Returns a disposed batch geometry's arrays to the pool. */
+function figBatchRecycle(g) {
+  for (const b of figBatchBuffers(g)) {
+    if (b && b.array) {
+      figPoolGive(b.array);
+      b.array = null;
+    }
+  }
+}
+
+/** A new region-batch geometry for a finished job part, sized to the part's capacity (drawn up to its index count). */
+function figBatchGeometry(part, keepCpu) {
+  const A = part.A;
+  const g = new THREE.BufferGeometry();
+  // One interleaved u16x4 record per vertex: xyz normalised position, w the handle id (normalised; the shader scales
+  // it back). Both are native D3D11 vertex formats: a 3-component u16 position made ANGLE keep a converted copy of
+  // every batch buffer in the GPU process, rebuilt after each rebuild (XB-7).
+  const ib = new THREE.InterleavedBuffer(A.ph, 4);
+  g.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 4, 0, true));
+  g.setAttribute('aHid', new THREE.InterleavedBufferAttribute(ib, 1, 3, true));
+  g.setAttribute('aOct', new THREE.BufferAttribute(A.oct, 2, true));
+  g.setAttribute('aCol', new THREE.BufferAttribute(A.col, 4, true));
+  g.setAttribute('aPbr', new THREE.BufferAttribute(A.pbr, 4, true));
+  g.setIndex(new THREE.BufferAttribute(A.idx, 1));
+  g.setDrawRange(0, part.ni);
+  g.boundingSphere = part.sphere;
+  if (!keepCpu) for (const b of figBatchBuffers(g)) b.onUpload(figPoolRelease);
+  return g;
+}
+
+/**
+ * Writes a rebuilt part into an existing batch geometry of the same capacity (F2): the arrays are swapped in and only
+ * the used ranges upload (bufferSubData), so the GL buffers live on instead of a new set per rebuild (about 18 rebuilds
+ * a second while walking, each freeing and allocating buffers in the GPU process). Without CPU copies the arrays are
+ * released again after the upload (the release callbacks also run on an update).
+ */
+function figBatchUpdate(g, part) {
+  const A = part.A;
+  const set = (target, arr, used) => {
+    // The replaced array (a CPU copy, or one that never reached the GPU) goes back to the pool.
+    if (target.array && target.array !== arr) figPoolGive(target.array);
+    target.array = arr;
+    target.clearUpdateRanges();
+    target.addUpdateRange(0, used);
+    target.needsUpdate = true;
+  };
+  set(g.attributes.position.data, A.ph, part.nv * 4);
+  set(g.attributes.aOct, A.oct, part.nv * 2);
+  set(g.attributes.aCol, A.col, part.nv * 4);
+  set(g.attributes.aPbr, A.pbr, part.nv * 4);
+  set(g.index, A.idx, part.ni);
+  g.setDrawRange(0, part.ni);
+  g.boundingSphere = part.sphere;
 }
 
 /* ---- preview-main.js ---- */
