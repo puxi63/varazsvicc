@@ -4,7 +4,7 @@
    First visit (PERF-PLAN.md 6.W13): nothing big is precached while the game loads its own files; whatever the page
    fetches is cached as it goes, and the rest of the site is precached only when the page asks for it after the
    first play session (message 'precache'). */
-const CACHE = 'figurabolt-cf64eb8417';
+const CACHE = 'figurabolt-011853babb';
 
 /* Google Fonts and the three.js modules live in caches of their own, which a version bump does not wipe: the URLs
    are versioned by their hosts, so a stored copy stays right. */

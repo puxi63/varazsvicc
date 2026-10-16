@@ -185,8 +185,6 @@ button { font: inherit; color: inherit; }
   50% { transform: translate(-48px, -10px); } 67% { transform: translate(34px, 34px); } 83% { transform: translate(-12px, 46px); }
   100% { transform: translate(0, 0); }
 }
-#fade { position: absolute; inset: 0; background: var(--black); opacity: 0; pointer-events: none; transition: opacity 0.6s ease; z-index: 4; }
-#fade.on { opacity: 1; }
 
 /* ---------- Shared HUD material: deep plum lacquer with a candy-stripe top edge and a gilt rule ---------- */
 .panel {
@@ -603,7 +601,6 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 
   <div class="skip" id="skip" hidden></div>
   <div id="layers"></div>
-  <div id="fade"></div>
   <div class="panel narrow" id="narrow"></div>
 
   <div class="loader" id="loader">
@@ -17285,7 +17282,7 @@ function symbolImg(catKey) {
 function initHud() {
   for (const id of ['hud', 'galVal', 'galLabel', 'chipSorted', 'chipShelves', 'chipCards', 'chipSortedL', 'chipShelvesL', 'chipCardsL', 'saveInd', 'pauseHint',
     'cross', 'floater', 'card', 'ttKicker', 'ttTitle', 'ttSym', 'ttCat', 'ttRarity', 'ttPips', 'ttCount', 'ttDesc', 'ttActions', 'spells', 'carry', 'carryLabel',
-    'carryVal', 'carryList', 'carryNext', 'toasts', 'prompts', 'tip', 'notice', 'perf', 'skip', 'layers', 'fade', 'narrow', 'app', 'loader', 'loadBar', 'loadStatus',
+    'carryVal', 'carryList', 'carryNext', 'toasts', 'prompts', 'tip', 'notice', 'perf', 'skip', 'layers', 'narrow', 'app', 'loader', 'loadBar', 'loadStatus',
     'loadTitle', 'loadSub', 'loadSafe', 'loadSafeHint', 'lost', 'lostTitle', 'lostText', 'lostLighter', 'lostReload']) UI[id] = byId(id);
   UI.galLabel.textContent = TXT.hudGalleon;
   UI.chipSortedL.textContent = TXT.hudSorted;
@@ -20036,7 +20033,7 @@ function initCrumbs() {
    Render size (PERF-PLAN.md 6.W2): the canvas keeps its default size until the boot is done, then it is sized once.
    Xbox: discrete 720p / 900p / 1080p heights; Mentő 720p / 540p; PC tiers a continuous scale.
    ------------------------------------------------------------------------------------------------ */
-const RES = { sized: false, xboxHeights: [1080, 900, 720], mentoScales: [1, 0.75] };
+const RES = { sized: false, pending: false, xboxHeights: [1080, 900, 720], mentoScales: [1, 0.75] };
 
 function computeBasePixelRatio() {
   const T = tierDef();
@@ -20046,13 +20043,35 @@ function computeBasePixelRatio() {
   return Math.min(dpr, T.maxW / w, T.maxH / h);
 }
 
+/**
+ * Asks for a new render size (governor step, tier change, window resize, composer, context restore). A canvas resize
+ * clears the drawing buffer, and the compositor presents that cleared buffer unless a draw follows in the same task:
+ * resizing after the frame was drawn showed the whole 3D view black for one frame at every governor resolution step
+ * (the PC "fekete villanás" of 2026-10-15). So the drawing buffer only changes in flushRenderSize(), immediately before
+ * a draw. The camera follows at once (no canvas change), so aiming and culling never use a stale aspect.
+ */
+function requestRenderSize() {
+  RES.pending = true;
+  if (!RES.sized) return;
+  camera.aspect = Math.max(1, window.innerWidth) / Math.max(1, window.innerHeight);
+  camera.updateProjectionMatrix();
+}
+
+/** Applies a requested render size; only called right before a draw in the same task (tick, boot draws, debug API). */
+function flushRenderSize() {
+  if (RES.pending) updateRenderSize();
+}
+
+/** Applies the render size now. The game requests it instead (requestRenderSize); the bench harness calls this. */
 function updateRenderSize() {
+  RES.pending = false;
   if (!RES.sized) return;
   const w = Math.max(1, window.innerWidth);
   const h = Math.max(1, window.innerHeight);
   const pr = basePR * renderScale;
-  renderer.setPixelRatio(pr);
-  renderer.setSize(w, h, false);
+  // One canvas size assignment: setPixelRatio followed by setSize assigned it twice when the window size changed as
+  // well (every width or height change reallocates the drawing buffer and its MSAA buffers, 23-30 ms on the UHD 630).
+  renderer.setDrawingBufferSize(w, h, pr);
   if (composer) {
     composer.setPixelRatio(pr);
     composer.setSize(w, h);
@@ -20105,7 +20124,8 @@ function ensureComposer() {
     c.addPass(output);
     composer = c;
     POST.bloom = bloom;
-    updateRenderSize();
+    // Pass sizes and the pixel ratio follow with the next draw (never resize the canvas in this promise task).
+    requestRenderSize();
   }).catch((err) => {
     console.warn('[render] bloom unavailable', err);
     if (composerPromise === promise) composerPromise = null;
@@ -20148,10 +20168,14 @@ function applyQuality(tier, reason = 'user') {
   GOV.resetForTier(reason);
   if (T.composer) ensureComposer();
   else disposeComposer();
-  updateRenderSize();
+  requestRenderSize();
 }
 
-/** User or Auto tier change during play: applied behind the last frame, then the new programs compile. */
+/**
+ * User or Auto tier change during play: applied behind the last frame, then the new programs compile. The last frame
+ * stays on screen meanwhile: the new canvas size is only applied by the first frame drawn after the hold (a resize
+ * under renderHold showed a black 3D view for the whole compile, 3.9 s on the UHD 630).
+ */
 async function switchQuality(reason = 'user', forcedTier = null) {
   const job = ++qualityJob;
   renderHold = true;
@@ -20209,6 +20233,8 @@ async function compileScene() {
    ------------------------------------------------------------------------------------------------ */
 /** Frame-time limits of the governor (ms): 30 fps with margin (a steady 33.3 ms is 30 fps, F5) and the 51 fps target. */
 const GOV_MS = { slow: 36, target: 19.5 };
+/** Samples are ignored for this long after the loader starts to hide (PC: its 1 s fade plus a short settle). */
+const GOV_SETTLE_MS = 1500;
 const GOV = {
   on: true, ladder: [], pos: 0, start: 0, soft: 0, win: new Float32Array(240), wn: 0, wi: 0, sorted: new Float32Array(240),
   gpu: new Float32Array(60), gn: 0, gi: 0, tq: null, q: null, qBusy: false, lastDown: -1e9, lastUp: -1e9, lastRes: -1e9,
@@ -20286,7 +20312,8 @@ const GOV = {
     const levelChanged = lod !== QUALITY.level;
     QUALITY.level = lod;
     if (levelChanged && kit && typeof kit.setDetailLevel === 'function') kit.setDetailLevel(lod);
-    updateRenderSize();
+    // step() runs from sample() after the frame was drawn: the new size lands right before the next frame's draw.
+    requestRenderSize();
     if (levelChanged && !silent) notifyQuality('governor');
   },
   /**
@@ -20328,6 +20355,9 @@ const GOV = {
   /** Called once per rendered frame with the rAF interval in ms. */
   sample(ms) {
     if (!this.on || !LOOP.shownAt || renderHold) return;
+    // The loader's fade and the first frames after the boot (300-550 ms without a new frame) are no measure of play:
+    // they made the first resolution step land 1.5 s after the loader, on the title screen.
+    if (performance.now() - LOOP.shownAt < GOV_SETTLE_MS) return;
     this.win[this.wi] = ms;
     this.wi = (this.wi + 1) % this.win.length;
     this.wn = Math.min(this.win.length, this.wn + 1);
@@ -20830,17 +20860,26 @@ function tick(dt, doRender, raw = dt) {
   }
   if (doRender && !renderHold) {
     LOOP.renderAcc += raw;
-    if (LOOP.renderAcc >= 1 / 60 - 0.004 || raw > 1 / 75) {
+    // A pending size change is never left to a skipped tick (the 60 fps limiter on a faster display).
+    if (RES.pending || LOOP.renderAcc >= 1 / 60 - 0.004 || raw > 1 / 75) {
       LOOP.renderAcc = Math.min(LOOP.renderAcc - 1 / 60, 1 / 60);
       if (LOOP.renderAcc < 0) LOOP.renderAcc = 0;
       try {
+        // The canvas only changes size here, right before this frame's draw (see requestRenderSize).
+        flushRenderSize();
         gpuTimerPoll();
         renderer.info.reset();
         const q = gpuTimerBegin();
         if (composer && tierDef().composer) composer.render(dt);
         else renderer.render(scene, camera);
         gpuTimerEnd(q);
+        // After a context restore the overlay goes away with the first drawn frame, never before it.
+        if (CTX.hideOnDraw) {
+          CTX.hideOnDraw = false;
+          UI.lost.hidden = true;
+        }
         const ms = Math.max(raw, 1 / 240) * 1000;
+        // A governor step taken here only requests the new size (the next frame applies it before drawing).
         GOV.sample(ms);
         updatePerf(Math.max(raw, 1 / 60), ms);
       } catch (err) {
@@ -20962,6 +21001,8 @@ const DEBUG_API = {
     if (Number.isFinite(pos)) {
       GOV.pos = Math.max(0, Math.min(GOV.ladder.length - 1, pos));
       GOV.applyPos();
+      // Test hook: the harness stops the loop and draws by itself, so the size is applied before this returns.
+      flushRenderSize();
     }
     return { on: GOV.on, pos: GOV.pos };
   },
@@ -20971,6 +21012,7 @@ const DEBUG_API = {
     SETTINGS.quality = id;
     storeSettings();
     await switchQuality('user');
+    flushRenderSize();
     return QUALITY.tier;
   },
   /** Holds the binocular zoom at k (0..1), or releases it (null). */
@@ -21302,7 +21344,7 @@ function updatePerf(dt, rawMs) {
 /* ------------------------------------------------------------------------------------------------
    Context loss and recovery (PERF-PLAN.md 6.W5)
    ------------------------------------------------------------------------------------------------ */
-const CTX = { lost: false, restored: false, timer: 0, loseExt: null };
+const CTX = { lost: false, restored: false, timer: 0, loseExt: null, hideOnDraw: false };
 
 class BootAbort extends Error {}
 
@@ -21393,11 +21435,12 @@ async function onContextRestored() {
     if (kit && typeof kit.setEnvMap === 'function') kit.setEnvMap(getFigureEnvMap());
     if (kit && typeof kit.onContextRestored === 'function') kit.onContextRestored();
     applyGovernorEffects(GOV.fxLevel);
-    updateRenderSize();
+    requestRenderSize();
     await compileScene();
     CTX.lost = false;
     BOOT.lostAt = 0;
-    UI.lost.hidden = true;
+    // The overlay stays until the first frame is drawn (tick), so the restored, still empty canvas never shows.
+    CTX.hideOnDraw = true;
     LOOP.last = 0;
     renderer.setAnimationLoop(frame);
     LOOP.running = true;
@@ -21477,6 +21520,7 @@ async function generateTexturesStaged(from, to) {
 }
 
 function wireLifecycle() {
+  // The new size is requested only: the next frame applies it right before its draw (see requestRenderSize).
   window.addEventListener('resize', () => {
     basePR = computeBasePixelRatio();
     if (RES.sized) GOV.applyPos(true);
@@ -21573,6 +21617,7 @@ async function stagedCompile(from, to) {
  * (kit internals are never forced visible: all their level-of-detail buffers would upload at once).
  */
 async function warmFirstUse() {
+  flushRenderSize();
   const list = compileList();
   const kitGroup = kit ? kit.group : null;
   const shown = [];
@@ -21623,11 +21668,22 @@ async function warmFirstUse() {
     for (const p of shown) p.visible = false;
     for (const o of culled) o.frustumCulled = true;
   }
+  // Without a composer the 1×1 frame went into the canvas itself, black apart from one pixel: a full frame follows in
+  // the same task, so that frame can never be presented (only the opaque loader hid it).
+  if (!target) {
+    try {
+      renderer.info.reset();
+      renderer.render(scene, camera);
+    } catch (err) {
+      console.warn('[render] warm-up frame', err);
+    }
+  }
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 }
 
 /** Renders one frame (composer on Magas) and waits two animation frames. */
 async function renderAndSettle() {
+  flushRenderSize();
   renderer.info.reset();
   if (composer && tierDef().composer) composer.render(1 / 60);
   else renderer.render(scene, camera);
@@ -21865,6 +21921,8 @@ async function boot(hotData) {
   RES.sized = true;
   basePR = computeBasePixelRatio();
   GOV.applyPos(true);
+  // Applied at once: the opaque loader covers the canvas, and this breadcrumb names the step if the resize loses it.
+  updateRenderSize();
   crumb('first-frame');
   setLoad(0.97, TXT.loadShaders);
   updateTitleCamera(0);
